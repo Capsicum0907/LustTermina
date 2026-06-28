@@ -1690,7 +1690,8 @@ impl App {
                                                 egui::TextEdit::singleline(
                                                     &mut self.startup_tabs[i].name,
                                                 )
-                                                .hint_text("名前"),
+                                                .hint_text("名前")
+                                                .vertical_align(egui::Align::Center),
                                             );
                                             ui.add_space(6.0);
                                             // シェル選択（既定タブと同じ前面ドロップダウン）
