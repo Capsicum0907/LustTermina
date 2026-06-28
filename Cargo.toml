@@ -18,8 +18,8 @@ windows = { version = "0.62.2", features = ["Win32_UI_Shell", "Win32_UI_WindowsA
 [build-dependencies]
 winresource = "0.1.31"
 
-# Release builds: strip symbols and trim absolute paths so the binary
-# carries no local build paths (e.g. the developer's home directory).
+# Release builds: strip symbols to shrink the binary and drop debug info.
+# To also scrub local build paths (e.g. the home directory) from the binary,
+# build with RUSTFLAGS="--remap-path-prefix=<home>=<placeholder>".
 [profile.release]
 strip = true
-trim-paths = "all"
