@@ -80,3 +80,9 @@ cargo build --release
 ## 名前について
 
 **L**ust ×（**R**ust）の L/R 引っかけ ＋ **Termina**（terminus＝終端）。カナ「ラスト」は Lust / Rust / Last の三重掛け。
+
+## ライセンス
+
+[MIT](LICENSE-MIT) または [Apache License 2.0](LICENSE-APACHE) のデュアルライセンス。好きな方を選んで使えます。
+
+アイコン表示に [Material Icons](https://github.com/google/material-design-icons)（© Google, Apache License 2.0）を同梱しています。
