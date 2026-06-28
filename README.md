@@ -2,7 +2,7 @@
 
 **Windows 向けのターミナルエミュレータ。** 複数のシェルを縦タブで並べて使えて、タブごとに色分けでき、よく使う作業環境を「起動タブ」として保存しておける。Rust + egui 製で軽快に動く。
 
-<!-- TODO: スクリーンショットを追加 -->
+![LustTermina — Windows 向けターミナルエミュレータ](assets/screenshots/screenshot-main.png)
 
 ## できること
 
@@ -14,6 +14,24 @@
 - **スクロールバック** — マウスホイールで過去の出力（最大 1 万行）を遡れる。入力すると最新位置へ戻る。
 - **設定は画面から** — 既定のシェル・作業フォルダ・テーマ・タブパネルの左右配置を GUI で変更。変更内容はファイルに保存され、次回も引き継がれる。
 - **見た目** — シェルの種類ごとにアイコンを表示。ウィンドウ／タスクバーにも独自アイコン。
+
+## スクリーンショット
+
+**タブごとに色分け** — 環境ごとに背景色・アクセントカラーを割り当てて見分けられます。
+
+| | |
+|:--:|:--:|
+| <img src="assets/screenshots/tab-green.png" width="380" alt="緑に色分けしたタブ"> | <img src="assets/screenshots/tab-red.png" width="380" alt="赤に色分けしたタブ（WSL）"> |
+
+**色の設定 ／ 対応シェル** — 色はパレットから選択（「起動タブに追加」で起動構成にも保存）。対応シェルは PowerShell 7・Windows PowerShell・コマンドプロンプト・VS Developer・Git Bash・WSL をアイコン付きで選べます。
+
+| | |
+|:--:|:--:|
+| <img src="assets/screenshots/color-picker.png" width="380" alt="背景色・アクセントカラーの選択"> | <img src="assets/screenshots/shell-picker.png" width="380" alt="シェルの選択"> |
+
+**日本語の表示・入力にも対応**
+
+<img src="assets/screenshots/japanese.png" width="600" alt="日本語の表示">
 
 ## 動作環境
 
