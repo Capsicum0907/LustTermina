@@ -29,6 +29,10 @@
 |:--:|:--:|
 | <img src="assets/screenshots/color-picker.png" width="380" alt="背景色・アクセントカラーの選択"> | <img src="assets/screenshots/shell-picker.png" width="380" alt="シェルの選択"> |
 
+**起動タブの編集** — よく使うタブ構成（名前・シェル・作業フォルダ・色・起動コマンド）をカードで編集。「現在のタブ構成を抜き出す」で、今開いているタブをそのまま起動構成として保存できます。
+
+<img src="assets/screenshots/startup-tabs.png" width="720" alt="起動タブの編集画面">
+
 **日本語の表示・入力にも対応**
 
 <img src="assets/screenshots/japanese.png" width="600" alt="日本語の表示">
