@@ -1011,13 +1011,28 @@ impl Session {
         // このフレームの選択範囲（term.selection から算出済み）。セル塗りで使う。
         let sel = content.selection;
 
-        // セル描画（背景塗り → グリフ → 下線/取り消し線。属性を反映）
+        // セル描画は 2 パスに分ける。理由:
+        // 全角(WIDE_CHAR)グリフは 2 セル幅で描かれるが、右半分に当たるスペーサセルの
+        // 背景塗りが「同フレームで後から」重なると、全角の右半分を塗り潰してしまう
+        // （既定背景では bg==body_bg で塗られず露見しないが、色付き背景＝Claude の
+        // ハイライト等では全角が左半分だけになる）。背景を全部塗ってからグリフを
+        // 全部描く順にすれば、背景がグリフを上書きすることが原理的に起きない。
+        struct DrawCell {
+            pos: Pos2,
+            rect: egui::Rect,
+            fg: Color32,
+            bg: Color32,
+            ch: char,
+            flags: Flags,
+            selected: bool,
+        }
+        let mut cells: Vec<DrawCell> = Vec::new();
         for cell in content.display_iter {
             let flags = cell.flags;
             let col = cell.point.column.0 as f32;
             let line = (cell.point.line.0 + off) as f32;
             let pos = Pos2::new(origin.x + col * cell_w, origin.y + line * cell_h);
-            let cell_rect = egui::Rect::from_min_size(pos, Vec2::new(cell_w, cell_h));
+            let rect = egui::Rect::from_min_size(pos, Vec2::new(cell_w, cell_h));
 
             // 色を解決（bold は基本色を明色化、dim は減光、inverse は前後景を入替）
             let bold = flags.contains(Flags::BOLD);
@@ -1029,42 +1044,60 @@ impl Session {
             if flags.contains(Flags::INVERSE) {
                 std::mem::swap(&mut fg, &mut bg);
             }
+            let selected = sel.as_ref().is_some_and(|r| r.contains(cell.point));
+            cells.push(DrawCell {
+                pos,
+                rect,
+                fg,
+                bg,
+                ch: cell.c,
+                flags,
+                selected,
+            });
+        }
 
-            // 背景（セッション背景と異なる時だけ塗る。同色は CentralPanel の塗りで足りる）
-            if bg != body_bg {
-                painter.rect_filled(cell_rect, 0.0, bg);
+        // パス1: 背景（セッション背景と異なる時だけ塗る。同色は CentralPanel の塗りで足りる）
+        //        ＋選択ハイライト（半透明をセル地の上、グリフより先に）
+        for c in &cells {
+            if c.bg != body_bg {
+                painter.rect_filled(c.rect, 0.0, c.bg);
             }
-
-            // 選択ハイライト（半透明をセル地の上に重ねる。グリフより先に塗る）
-            if sel.as_ref().is_some_and(|r| r.contains(cell.point)) {
-                painter.rect_filled(cell_rect, 0.0, SELECTION_BG);
+            if c.selected {
+                painter.rect_filled(c.rect, 0.0, SELECTION_BG);
             }
+        }
 
-            // グリフ（隠し属性 / ワイド文字の右半分スペーサ / 空白 は描かない）
-            let ch = cell.c;
-            let draw_glyph = !flags.contains(Flags::HIDDEN)
-                && !flags.contains(Flags::WIDE_CHAR_SPACER)
-                && ch != ' '
-                && ch != '\0';
+        // パス2: グリフ（隠し属性 / ワイド文字の右半分スペーサ / 空白 は描かない）
+        //        ＋下線 / 取り消し線
+        for c in &cells {
+            let draw_glyph = !c.flags.contains(Flags::HIDDEN)
+                && !c.flags.contains(Flags::WIDE_CHAR_SPACER)
+                && c.ch != ' '
+                && c.ch != '\0';
             if draw_glyph {
-                painter.text(pos, Align2::LEFT_TOP, ch, font.clone(), fg);
+                painter.text(c.pos, Align2::LEFT_TOP, c.ch, font.clone(), c.fg);
             }
 
-            // 下線（種類は問わず一律の実線で）/ 取り消し線
-            if flags.intersects(Flags::ALL_UNDERLINES) {
-                let y = pos.y + cell_h - 1.5;
+            // 全角は 2 セル幅なので下線/取り消し線もその幅で引く
+            let line_w = if c.flags.contains(Flags::WIDE_CHAR) {
+                cell_w * 2.0
+            } else {
+                cell_w
+            };
+            if c.flags.intersects(Flags::ALL_UNDERLINES) {
+                let y = c.pos.y + cell_h - 1.5;
                 painter.hline(
-                    egui::Rangef::new(pos.x, pos.x + cell_w),
+                    egui::Rangef::new(c.pos.x, c.pos.x + line_w),
                     y,
-                    egui::Stroke::new(1.0, fg),
+                    egui::Stroke::new(1.0, c.fg),
                 );
             }
-            if flags.contains(Flags::STRIKEOUT) {
-                let y = pos.y + cell_h * 0.5;
+            if c.flags.contains(Flags::STRIKEOUT) {
+                let y = c.pos.y + cell_h * 0.5;
                 painter.hline(
-                    egui::Rangef::new(pos.x, pos.x + cell_w),
+                    egui::Rangef::new(c.pos.x, c.pos.x + line_w),
                     y,
-                    egui::Stroke::new(1.0, fg),
+                    egui::Stroke::new(1.0, c.fg),
                 );
             }
         }
