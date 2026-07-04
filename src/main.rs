@@ -1534,7 +1534,7 @@ struct App {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, launch: Launch) -> Self {
         setup_fonts(&cc.egui_ctx);
         // egui のテーマをダーク固定（set_visuals は毎フレームのシステム追従に
         // 上書きされるが、theme_preference は設定として永続する）。メニュー等が黒くなる。
@@ -1597,8 +1597,21 @@ impl App {
 
         // 起動タブ：定義があれば順に開く。各項目は未指定なら既定にフォールバック。
         // 定義が無ければ従来どおり既定シェル1枚。
+        // ただし --cwd で起動された場合（Explorer の「このディレクトリで開く」）は、
+        // 起動タブ定義を無視してそのフォルダで1枚だけ開く（「ここで開く」の意図に素直）。
         let mut sessions: Vec<Session> = Vec::new();
-        if startup_tabs.is_empty() {
+        if let Launch::Cwd(path) = &launch {
+            // タブ名はフォルダ名（末尾要素）にする。取れなければ既定シェル名にフォールバック。
+            let title = std::path::Path::new(path)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{} 1", shells[default_shell].short));
+            let mut s = Session::spawn(&cc.egui_ctx, title, &shells[default_shell], path);
+            s.bg = default_bg;
+            s.accent = default_accent;
+            sessions.push(s);
+        } else if startup_tabs.is_empty() {
             let mut s = Session::spawn(
                 &cc.egui_ctx,
                 format!("{} 1", shells[default_shell].short),
@@ -3396,7 +3409,27 @@ impl eframe::App for App {
     }
 }
 
+// 起動時の意図（コマンドライン引数から決まる）。Explorer 連携の入口はここに集約し、
+// 将来 --run <script> やインストール系（--install など）もこの enum に足していく。
+enum Launch {
+    Normal,      // 通常起動：起動タブ定義に従う
+    Cwd(String), // --cwd <path>：そのフォルダでタブ1枚（起動タブ定義は無視）
+}
+
+// 引数列（プログラム名は除いたもの）を解釈して起動意図を返す。
+fn parse_launch<I: Iterator<Item = String>>(mut args: I) -> Launch {
+    while let Some(a) = args.next() {
+        if a == "--cwd" {
+            if let Some(p) = args.next() {
+                return Launch::Cwd(p);
+            }
+        }
+    }
+    Launch::Normal
+}
+
 fn main() -> eframe::Result {
+    let launch = parse_launch(std::env::args().skip(1));
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
         .expect("load window icon");
     let native_options = eframe::NativeOptions {
@@ -3408,6 +3441,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "LustTermina",
         native_options,
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, launch)))),
     )
 }
