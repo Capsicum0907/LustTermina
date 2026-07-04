@@ -12,6 +12,7 @@
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use egui::{Align2, Color32, FontId, Pos2, Sense, Vec2};
@@ -703,6 +704,23 @@ impl EventListener for EventProxy {
     }
 }
 
+// 起動コマンドの投入ペース（出力アイドル・ゲーティング）の既定値。
+// 本文/Enter を送るたびに「PTY 出力が quiet ミリ秒静まった」＝相手が入力を受け付けられる
+// 状態、とみなして次を送る。素のシェル（cooked mode の行バッファ）でも claude 等の TUI
+// （raw mode で1バイトずつ自前処理）でも同じロジックで成立させるための仕組み。出力が延々
+// 続くケース（top 等）で固まらないよう max_wait で打ち切る。claude 等をプログラム名で特別
+// 扱いはしない（ハードコード回避）。
+// これらは既定値で、config.toml の startup_quiet_ms / startup_max_wait_ms で上書きできる
+// （通信待ちで一時的に出力が止まるコマンドの取りこぼしは、quiet を上げて詰める）。
+const STARTUP_QUIET_MS: u64 = 800;
+const STARTUP_MAX_WAIT_MS: u64 = 8000;
+fn default_startup_quiet_ms() -> u64 {
+    STARTUP_QUIET_MS
+}
+fn default_startup_max_wait_ms() -> u64 {
+    STARTUP_MAX_WAIT_MS
+}
+
 // ---- セッション（1タブ = PTY + Term + 読み取りスレッド）----
 struct Session {
     term: Arc<Mutex<Term<EventProxy>>>,
@@ -721,6 +739,9 @@ struct Session {
     // マウスモーション報告(1002/1003)の重複抑制。同じセル上の移動は1回だけ報告する
     // （画素ごとに送るとアプリへ洪水になる）。直近に報告したセル(col,row)。
     last_mouse_cell: Option<(usize, usize)>,
+    // PTY から最後に出力が来た時刻。リーダースレッドが読むたびスタンプする。
+    // 起動コマンドの投入ペーサ（send_commands_paced）が「出力が静まったか」の判定に使う。
+    last_output: Arc<Mutex<Instant>>,
     _child: Box<dyn portable_pty::Child + Send + Sync>,
 }
 
@@ -762,10 +783,14 @@ impl Session {
         let term = Term::new(Config::default(), &init, proxy);
         let term = Arc::new(Mutex::new(term));
 
+        // 起動コマンド投入ペーサ用：最後に PTY 出力が来た時刻。
+        let last_output = Arc::new(Mutex::new(Instant::now()));
+
         // PTY 読み取りスレッド: bytes → VT パーサ → グリッド更新 → 再描画要求
         {
             let term = term.clone();
             let ctx = ctx.clone();
+            let last_output = last_output.clone();
             let mut reader = reader;
             thread::spawn(move || {
                 let mut parser: Processor = Processor::new();
@@ -776,6 +801,9 @@ impl Session {
                         Ok(n) => {
                             if let Ok(mut term) = term.lock() {
                                 parser.advance(&mut *term, &buf[..n]);
+                            }
+                            if let Ok(mut t) = last_output.lock() {
+                                *t = Instant::now();
                             }
                             ctx.request_repaint();
                         }
@@ -797,14 +825,60 @@ impl Session {
             cwd: cwd.to_string(),
             preedit: String::new(),
             last_mouse_cell: None,
+            last_output,
             _child: child,
         }
     }
 
-    // 1行を pty へ送る（末尾 CR）。起動コマンドの投入に使う。
-    fn send_line(&self, line: &str) {
-        self.send(line.as_bytes());
-        self.send(b"\r");
+    // 起動コマンド列を「出力が静まってから次」の順で投入する（出力アイドル・ゲーティング）。
+    // 各コマンドで: 本文を書く → 出力が静まるまで待つ → Enter を単独で書く → また待つ。
+    // 本文と Enter を時間的に分離することで、claude 等の TUI が連続入力を「ペースト」と
+    // 誤認して Enter を送信でなく改行として食う問題を避ける。UI スレッドを止めないよう
+    // 別スレッドで回す。settle 判定・上限は STARTUP_QUIET_MS / STARTUP_MAX_WAIT_MS。
+    fn send_commands_paced(&self, commands: Vec<String>, quiet_ms: u64, max_wait_ms: u64) {
+        if commands.is_empty() {
+            return;
+        }
+        let writer = self.writer.clone();
+        let last_output = self.last_output.clone();
+        thread::spawn(move || {
+            let quiet = Duration::from_millis(quiet_ms);
+            let max_wait = Duration::from_millis(max_wait_ms);
+            let poll = Duration::from_millis(20);
+            // 「送信して良い状態」まで待つ。まず quiet だけ必ず空ける（直前の write と
+            // 次の write を時間的に分離＝ペースト誤認回避。エコーが届く前に last_output が
+            // 古いままで即 return してしまう競合も、この床で防ぐ）。その後、出力がまだ
+            // 続いていれば静まるまで延長する（claude 起動時の描画バースト等）。max_wait で打ち切り。
+            let wait_settle = || {
+                thread::sleep(quiet);
+                let deadline = Instant::now() + max_wait;
+                loop {
+                    let idle = last_output
+                        .lock()
+                        .map(|t| t.elapsed())
+                        .unwrap_or(quiet)
+                        >= quiet;
+                    if idle || Instant::now() >= deadline {
+                        break;
+                    }
+                    thread::sleep(poll);
+                }
+            };
+            let write = |bytes: &[u8]| {
+                if let Ok(mut w) = writer.lock() {
+                    let _ = w.write_all(bytes);
+                    let _ = w.flush();
+                }
+            };
+            // まず初期プロンプト（シェル起動時の出力）が落ち着くのを待つ。
+            wait_settle();
+            for cmd in &commands {
+                write(cmd.as_bytes());
+                wait_settle(); // 本文と Enter を分離＋エコーが落ち着くまで
+                write(b"\r");
+                wait_settle(); // コマンド実行に伴う出力が落ち着くまで
+            }
+        });
     }
 
     fn scroll_to_bottom(&self) {
@@ -1388,6 +1462,12 @@ struct Settings {
     panel: String, // "left" | "right"（タブパネルの位置。空=left）
     #[serde(default)]
     startup_tabs: Vec<StartupTab>,
+    // 起動コマンドの投入ペース（ミリ秒）。未指定は既定値。通信待ちで出力が一時停止する
+    // コマンド（例: /remote-control）を取りこぼすときは startup_quiet_ms を上げる。
+    #[serde(default = "default_startup_quiet_ms")]
+    startup_quiet_ms: u64,
+    #[serde(default = "default_startup_max_wait_ms")]
+    startup_max_wait_ms: u64,
 }
 
 // 設定ファイルのパス。APPDATA をベースにし、パスをベタ書きしない。
@@ -1444,6 +1524,8 @@ struct App {
     default_bg: Color32,     // 新規タブの既定背景色
     default_accent: Color32, // 新規タブの既定アクセント色
     panel_right: bool,       // タブパネルを右に置くか（false=左）
+    startup_quiet_ms: u64,   // 起動コマンド投入の静穏窓（config 可変、既定 STARTUP_QUIET_MS）
+    startup_max_wait_ms: u64, // 同・待ち上限（config 可変、既定 STARTUP_MAX_WAIT_MS）
     startup_tabs: Vec<StartupTab>, // 起動時に開くタブ定義（空＝既定シェル1枚）
     startup_shell_open: Option<usize>, // 起動タブ編集：シェルDDを開いているカード
     startup_color_open: Option<(usize, bool)>, // 色パレットを開いているカード（bool=accent）
@@ -1487,9 +1569,13 @@ impl App {
         let mut default_bg = DEFAULT_BG;
         let mut default_accent = ACCENT_GREEN;
         let mut panel_right = false;
+        let mut startup_quiet_ms = STARTUP_QUIET_MS;
+        let mut startup_max_wait_ms = STARTUP_MAX_WAIT_MS;
         let mut startup_tabs: Vec<StartupTab> = Vec::new();
         if let Some(cfg) = load_settings() {
             panel_right = cfg.panel == "right";
+            startup_quiet_ms = cfg.startup_quiet_ms;
+            startup_max_wait_ms = cfg.startup_max_wait_ms;
             if let Some(i) = shells.iter().position(|s| s.short == cfg.default_shell) {
                 default_shell = i;
             }
@@ -1543,9 +1629,8 @@ impl App {
                 let mut s = Session::spawn(&cc.egui_ctx, name, &shells[si], &cwd);
                 s.bg = bg;
                 s.accent = accent;
-                for cmd in &st.commands {
-                    s.send_line(cmd);
-                }
+                // 出力が静まってから次を送る（claude 等の TUI にも投入できるように）。
+                s.send_commands_paced(st.commands.clone(), startup_quiet_ms, startup_max_wait_ms);
                 sessions.push(s);
             }
         }
@@ -1569,6 +1654,8 @@ impl App {
             default_bg,
             default_accent,
             panel_right,
+            startup_quiet_ms,
+            startup_max_wait_ms,
             startup_tabs,
             startup_shell_open: None,
             startup_color_open: None,
@@ -1595,6 +1682,8 @@ impl App {
             default_bg: color_to_hex(self.default_bg),
             default_accent: color_to_hex(self.default_accent),
             panel: if self.panel_right { "right".into() } else { "left".into() },
+            startup_quiet_ms: self.startup_quiet_ms,
+            startup_max_wait_ms: self.startup_max_wait_ms,
             // 保存時に commands_buf（複数行テキスト）→ commands（行配列、空行除去）へ。
             startup_tabs: self
                 .startup_tabs
