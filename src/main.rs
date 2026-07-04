@@ -60,6 +60,9 @@ const TAB_HOVER_BG: Color32 = Color32::from_gray(42);
 const TAB_TEXT: Color32 = Color32::from_gray(225); // 非アクティブ＝白っぽく
 const TAB_TEXT_ACTIVE: Color32 = Color32::from_gray(245);
 const ACCENT_GREEN: Color32 = Color32::from_rgb(0x19, 0xC3, 0x7D); // アクセント（アイコンと同じ緑）
+// 破壊的アクション（データ初期化・アンインストール）用の赤。緑=選択専用とは役割を分ける。
+const DANGER_FILL: Color32 = Color32::from_rgb(0x5A, 0x28, 0x28);
+const DANGER_BORDER: Color32 = Color32::from_rgb(0x8A, 0x40, 0x40);
 
 // テキスト選択のハイライト（半透明。下地の bg・セル色の上に重ねて使う）
 const SELECTION_BG: Color32 = Color32::from_rgba_premultiplied(0x3A, 0x5A, 0x8C, 0x88);
@@ -1471,6 +1474,11 @@ struct Settings {
     startup_max_wait_ms: u64,
 }
 
+// ユーザーのホーム（%USERPROFILE%）。既定 cwd 等の基準。取れなければ空。
+fn home_dir() -> String {
+    std::env::var("USERPROFILE").unwrap_or_default()
+}
+
 // 設定ファイルのパス。APPDATA をベースにし、パスをベタ書きしない。
 fn config_path() -> Option<std::path::PathBuf> {
     let base = std::env::var_os("APPDATA")?;
@@ -1503,6 +1511,7 @@ enum SettingsTab {
     General, // 既定（パネル位置・既定シェル・初期ディレクトリ）
     Theme,   // テーマ（既定の背景・アクセント）
     Startup, // 起動タブ
+    System,  // システム（データフォルダ・初期化・アンインストール）
 }
 
 // ---- アプリ本体（複数セッション ＋ 縦タブ）----
@@ -1533,7 +1542,7 @@ struct App {
     card_drag: Option<TabDrag>,        // 起動タブカードの D&D 並べ替え状態
     toast: Option<(String, std::time::Instant)>, // 一時通知（保存しました 等）
     // 別インスタンスから転送された「このフォルダで開く」要求の受信口（本体のみ Some）。
-    ipc_rx: Option<mpsc::Receiver<String>>,
+    ipc_rx: Option<mpsc::Receiver<IpcMsg>>,
 }
 
 impl App {
@@ -1546,7 +1555,7 @@ impl App {
         // ネイティブ枠のままなのでリサイズ/スナップ/最大化は維持。
         cc.egui_ctx
             .send_viewport_cmd(egui::ViewportCommand::SetTheme(egui::SystemTheme::Dark));
-        let home = std::env::var("USERPROFILE").unwrap_or_default();
+        let home = home_dir();
         let shells = discover_shells();
         // 各シェルの exe からアイコンを抽出してテクスチャ化（メニュー表示用）
         let shell_icons: Vec<Option<egui::TextureHandle>> = shells
@@ -1614,6 +1623,16 @@ impl App {
             s.bg = default_bg;
             s.accent = default_accent;
             sessions.push(s);
+        } else if let Launch::RunScript(path) = &launch {
+            // --run：スクリプトを、そのフォルダで実行するタブ1枚（起動タブ定義は無視）。
+            sessions.push(spawn_script_session(
+                &cc.egui_ctx,
+                path,
+                &shells,
+                default_shell,
+                default_bg,
+                default_accent,
+            ));
         } else if startup_tabs.is_empty() {
             let mut s = Session::spawn(
                 &cc.egui_ctx,
@@ -1699,6 +1718,21 @@ impl App {
         self.active = self.sessions.len() - 1;
     }
 
+    // スクリプト（.ps1/.bat/.cmd）を、そのファイルのあるフォルダで実行するタブを開く。
+    fn open_script_tab(&mut self, ctx: &egui::Context, path: &str) {
+        let sess = spawn_script_session(
+            ctx,
+            path,
+            &self.shells,
+            self.default_shell,
+            self.default_bg,
+            self.default_accent,
+        );
+        self.next_id += 1;
+        self.sessions.push(sess);
+        self.active = self.sessions.len() - 1;
+    }
+
     // 一時通知を出す（数秒で自動的に消える）。
     fn show_toast(&mut self, msg: impl Into<String>) {
         self.toast = Some((msg.into(), std::time::Instant::now()));
@@ -1742,6 +1776,23 @@ impl App {
             }
             let _ = std::fs::write(path, text);
         }
+    }
+
+    // 保存データ（config.toml）を削除し、永続設定をすべて既定へ戻す（初期化）。
+    // 破壊的なので呼び元で確認を取ってから呼ぶ。開いているタブ等の実行時状態は触らない。
+    // 既定値は new() と同じ定数を参照（一元管理）。
+    fn reset_settings(&mut self) {
+        if let Some(path) = config_path() {
+            let _ = std::fs::remove_file(path);
+        }
+        self.default_shell = 0;
+        self.default_cwd = home_dir();
+        self.default_bg = DEFAULT_BG;
+        self.default_accent = ACCENT_GREEN;
+        self.panel_right = false;
+        self.startup_quiet_ms = STARTUP_QUIET_MS;
+        self.startup_max_wait_ms = STARTUP_MAX_WAIT_MS;
+        self.startup_tabs.clear();
     }
 
     // 現在開いているタブ群を起動タブ定義に変換（スナップショット）。
@@ -1826,6 +1877,8 @@ impl App {
                     settings_nav_item(ui, &mut self.settings_tab, SettingsTab::Theme, "UI/テーマ", false);
                     ui.add_space(2.0);
                     settings_nav_item(ui, &mut self.settings_tab, SettingsTab::Startup, "起動タブ", false);
+                    ui.add_space(2.0);
+                    settings_nav_item(ui, &mut self.settings_tab, SettingsTab::System, "システム", false);
                 });
                 ui.separator();
             }
@@ -2434,6 +2487,70 @@ impl App {
                         }
                     }
                 }
+
+                // ===== システムタブ =====
+                if self.settings_tab == SettingsTab::System {
+                    ui.label(egui::RichText::new("データ").color(TAB_TEXT));
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "設定は %APPDATA%\\LustTermina\\config.toml に保存されます。",
+                        )
+                        .color(Color32::from_gray(150))
+                        .size(12.0),
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if primary_button(ui, "データフォルダを開く") {
+                            if let Some(dir) = config_dir() {
+                                let _ = std::fs::create_dir_all(&dir);
+                                let _ =
+                                    std::process::Command::new("explorer").arg(&dir).spawn();
+                            }
+                        }
+                        if danger_button(ui, "データを初期化") {
+                            if confirm_yes_no(
+                                "設定（config.toml）を削除し、すべて既定値に戻します。\nこの操作は元に戻せません。",
+                                "データの初期化",
+                            ) {
+                                self.reset_settings();
+                                self.show_toast("データを初期化しました");
+                            }
+                        }
+                    });
+
+                    ui.add_space(18.0);
+                    ui.separator();
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new("アンインストール").color(TAB_TEXT));
+                    ui.add_space(2.0);
+                    if let Some(scope) = installed_scope() {
+                        ui.label(
+                            egui::RichText::new(
+                                "アプリ本体・スタートメニュー・右クリック項目を削除します（データ削除は選択式）。",
+                            )
+                            .color(Color32::from_gray(150))
+                            .size(12.0),
+                        );
+                        ui.add_space(8.0);
+                        if danger_button(ui, "アンインストール") {
+                            // 確認とデータ削除選択は共通の TaskDialog（--uninstall と同じ）。
+                            if let Some(delete) = ask_uninstall() {
+                                perform_uninstall(scope, delete);
+                                // 本体を閉じてファイルロックを解放し、インストール先の自己削除を完了させる。
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                        }
+                    } else {
+                        ui.label(
+                            egui::RichText::new(
+                                "このアプリはインストールされていません（開発ビルド等）。",
+                            )
+                            .color(Color32::from_gray(150))
+                            .size(12.0),
+                        );
+                    }
+                }
             });
             // パネルが右ならナビを内容の右側に出す（タブパネルと同じ向き）。
             if panel_right {
@@ -2445,6 +2562,8 @@ impl App {
                     settings_nav_item(ui, &mut self.settings_tab, SettingsTab::Theme, "UI/テーマ", true);
                     ui.add_space(2.0);
                     settings_nav_item(ui, &mut self.settings_tab, SettingsTab::Startup, "起動タブ", true);
+                    ui.add_space(2.0);
+                    settings_nav_item(ui, &mut self.settings_tab, SettingsTab::System, "システム", true);
                 });
             }
         });
@@ -2693,6 +2812,11 @@ fn primary_button(ui: &mut egui::Ui, label: &str) -> bool {
 
 fn ghost_button(ui: &mut egui::Ui, label: &str) -> bool {
     settings_btn(ui, label, Color32::from_gray(34), Color32::from_gray(60))
+}
+
+// 破壊的アクション（初期化・アンインストール）。赤地で「戻せない操作」を示す。
+fn danger_button(ui: &mut egui::Ui, label: &str) -> bool {
+    settings_btn(ui, label, DANGER_FILL, DANGER_BORDER)
 }
 
 // カード左端のドラッグハンドル＝2列×3行の点（「クリリンの額」）。
@@ -2978,10 +3102,13 @@ impl eframe::App for App {
         // 別インスタンスから転送された「このフォルダで開く」要求を取り込む。
         // 借用を切るため一旦集めてから開く（open_dir_tab が self を可変借用するため）。
         if self.ipc_rx.is_some() {
-            let dirs: Vec<String> =
+            let msgs: Vec<IpcMsg> =
                 self.ipc_rx.as_ref().map(|rx| rx.try_iter().collect()).unwrap_or_default();
-            for d in dirs {
-                self.open_dir_tab(&ctx, &d);
+            for m in msgs {
+                match m {
+                    IpcMsg::OpenDir(d) => self.open_dir_tab(&ctx, &d),
+                    IpcMsg::RunScript(p) => self.open_script_tab(&ctx, &p),
+                }
             }
         }
 
@@ -3448,8 +3575,15 @@ impl eframe::App for App {
 // 生成は失敗する＝「本体が居るか」の判定を兼ねる。依存は増やさず、既に使っている windows
 // クレート（＋Win32_System_Pipes 機能）だけで実装する。
 
-// メッセージ書式は <verb>\t<payload>。将来 --run 等の verb を足せるようにしておく。
+// メッセージ書式は <verb>\t<payload>。cwd＝フォルダで開く、run＝スクリプトを実行。
 const IPC_VERB_CWD: &str = "cwd";
+const IPC_VERB_RUN: &str = "run";
+
+// 既存インスタンスへ転送する要求。UI スレッドで対応するタブを開く。
+enum IpcMsg {
+    OpenDir(String),  // フォルダを既定シェルのタブで開く
+    RunScript(String), // スクリプトを実行するタブを開く
+}
 
 // パイプ名。別ユーザーと衝突しないようユーザー名で分ける（per-user）。
 fn ipc_pipe_name() -> Vec<u16> {
@@ -3460,8 +3594,8 @@ fn ipc_pipe_name() -> Vec<u16> {
         .collect()
 }
 
-// 既存インスタンスへ「このフォルダで開く」を転送。本体が受け取れたら true、居なければ false。
-fn ipc_try_forward_cwd(path: &str) -> bool {
+// 既存インスタンスへ <verb>\t<path> を転送。本体が受け取れたら true、居なければ false。
+fn ipc_try_forward(verb: &str, path: &str) -> bool {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{CloseHandle, GENERIC_WRITE};
     use windows::Win32::Storage::FileSystem::{
@@ -3481,7 +3615,7 @@ fn ipc_try_forward_cwd(path: &str) -> bool {
             Ok(h) => h,
             Err(_) => return false, // 本体が居ない（パイプ無し）
         };
-        let msg = format!("{IPC_VERB_CWD}\t{path}");
+        let msg = format!("{verb}\t{path}");
         let ok = WriteFile(handle, Some(msg.as_bytes()), None, None).is_ok();
         let _ = CloseHandle(handle);
         ok
@@ -3490,7 +3624,7 @@ fn ipc_try_forward_cwd(path: &str) -> bool {
 
 // 受け口（サーバ）を1本だけ張る。既に他インスタンスが持っていれば None＝自分は本体でない。
 // 本体なら常駐スレッドでクライアントを順に捌き、受信したパスを Receiver 経由で UI に渡す。
-fn ipc_start_server(ctx: &egui::Context) -> Option<mpsc::Receiver<String>> {
+fn ipc_start_server(ctx: &egui::Context) -> Option<mpsc::Receiver<IpcMsg>> {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
     use windows::Win32::Storage::FileSystem::{ReadFile, PIPE_ACCESS_INBOUND};
@@ -3515,7 +3649,7 @@ fn ipc_start_server(ctx: &egui::Context) -> Option<mpsc::Receiver<String>> {
     if handle == INVALID_HANDLE_VALUE {
         return None; // 既に本体が居る（受け口は張らない）
     }
-    let (tx, rx) = mpsc::channel::<String>();
+    let (tx, rx) = mpsc::channel::<IpcMsg>();
     let ctx = ctx.clone();
     let raw = handle.0 as isize; // HANDLE は Send でないので数値で運ぶ
     thread::spawn(move || {
@@ -3541,11 +3675,16 @@ fn ipc_start_server(ctx: &egui::Context) -> Option<mpsc::Receiver<String>> {
                 let _ = DisconnectNamedPipe(handle);
             }
             if let Ok(s) = String::from_utf8(msg) {
-                if let Some(path) = s.strip_prefix(&format!("{IPC_VERB_CWD}\t")) {
-                    if !path.is_empty() {
-                        let _ = tx.send(path.to_string());
-                        ctx.request_repaint();
-                    }
+                let parsed = if let Some(p) = s.strip_prefix(&format!("{IPC_VERB_CWD}\t")) {
+                    (!p.is_empty()).then(|| IpcMsg::OpenDir(p.to_string()))
+                } else if let Some(p) = s.strip_prefix(&format!("{IPC_VERB_RUN}\t")) {
+                    (!p.is_empty()).then(|| IpcMsg::RunScript(p.to_string()))
+                } else {
+                    None
+                };
+                if let Some(m) = parsed {
+                    let _ = tx.send(m);
+                    ctx.request_repaint();
                 }
             }
         }
@@ -3634,6 +3773,94 @@ fn reg_delete_tree(root: windows::Win32::System::Registry::HKEY, subkey: &str) -
     rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND
 }
 
+// ---- スクリプト（.ps1/.bat/.cmd）を「LustTermina で実行」----
+// 右クリックの「LustTermina で実行」で、そのスクリプトのあるフォルダを cwd にして、拡張子に
+// 応じたインタープリタで直接起動する（実行後もシェルは開いたまま＝出力を確認できる）。
+// 対応拡張子・ラベル・レジストリキーはここ一箇所に集約（ベタ書き散逸を避ける）。
+const SCRIPT_RUN_LABEL: &str = "LustTermina で実行";
+const SCRIPT_EXTS: [&str; 3] = [".ps1", ".bat", ".cmd"];
+
+// 「プログラムから開く」(Open with) 一覧に LustTermina を候補として出すための登録先。
+// 既定ハンドラは奪わない：一覧に出るだけで、ユーザーが「常に使う」を選んで初めて既定になる。
+const APP_REG_KEY: &str = r"Software\Classes\Applications\lust_termina.exe";
+
+// SystemFileAssociations\<ext>\shell\LustTerminaRun：既定ハンドラを奪わず、右クリックに項目を
+// 足すだけの非侵襲な場所。アンインストールは自分のキーをツリーごと消す＝残骸ゼロ。
+fn script_ctx_key(ext: &str) -> String {
+    format!(r"Software\Classes\SystemFileAssociations\{ext}\shell\LustTerminaRun")
+}
+
+// スクリプトのあるフォルダ（cwd 用）。取れなければ空＝親プロセス継承。
+fn script_parent(path: &str) -> String {
+    std::path::Path::new(path)
+        .parent()
+        .and_then(|p| p.to_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+// 拡張子から「そのスクリプトを実行するシェル定義」を作る。対応外は None。
+// .ps1 → PowerShell（pwsh 優先、無ければ Windows PowerShell）を -File で。
+// .bat/.cmd → cmd /k（実行後もプロンプトを残す）。
+fn script_run_shell(path: &str) -> Option<ShellSpec> {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())?;
+    let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+    match ext.as_str() {
+        "ps1" => {
+            let prog = which("pwsh.exe").unwrap_or_else(|| {
+                format!("{sysroot}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")
+            });
+            Some(ShellSpec {
+                label: "PowerShell".into(),
+                short: "ps1".into(),
+                program: prog,
+                args: vec![
+                    "-NoExit".into(),
+                    "-ExecutionPolicy".into(),
+                    "Bypass".into(),
+                    "-File".into(),
+                    path.to_string(),
+                ],
+                icon_source: None,
+            })
+        }
+        "bat" | "cmd" => Some(ShellSpec {
+            label: "cmd".into(),
+            short: ext,
+            program: format!("{sysroot}\\System32\\cmd.exe"),
+            args: vec!["/k".into(), path.to_string()],
+            icon_source: None,
+        }),
+        _ => None,
+    }
+}
+
+// スクリプト実行タブ用の Session を1つ作る。拡張子で判定できなければ既定シェルでそのフォルダを
+// 開くだけ（実行はしないが、フォルダは開く＝握り潰さない）。
+fn spawn_script_session(
+    ctx: &egui::Context,
+    path: &str,
+    shells: &[ShellSpec],
+    default_shell: usize,
+    bg: Color32,
+    accent: Color32,
+) -> Session {
+    let spec = script_run_shell(path).unwrap_or_else(|| shells[default_shell].clone());
+    let dir = script_parent(path);
+    let title = std::path::Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| spec.short.clone());
+    let mut s = Session::spawn(ctx, title, &spec, &dir);
+    s.bg = bg;
+    s.accent = accent;
+    s
+}
+
 // 右クリック「LustTermina で開く」を登録。指定した exe パスを指す（インストーラは
 // インストール先を、単独の --install-context-menu は現在の exe を渡す）。
 // フォルダ選択時は %1（そのフォルダ）、背景クリック時は %V（今開いているフォルダ）。
@@ -3643,20 +3870,42 @@ fn install_context_menu(root: windows::Win32::System::Registry::HKEY, exe: &str)
     }
     let cmd_dir = format!("\"{exe}\" --cwd \"%1\"");
     let cmd_bg = format!("\"{exe}\" --cwd \"%V\"");
-    reg_set_sz(root, CTX_KEY_DIR, "", CTX_MENU_LABEL)
+    let mut ok = reg_set_sz(root, CTX_KEY_DIR, "", CTX_MENU_LABEL)
         && reg_set_sz(root, CTX_KEY_DIR, "Icon", exe)
         && reg_set_sz(root, &format!(r"{CTX_KEY_DIR}\command"), "", &cmd_dir)
         && reg_set_sz(root, CTX_KEY_BG, "", CTX_MENU_LABEL)
         && reg_set_sz(root, CTX_KEY_BG, "Icon", exe)
-        && reg_set_sz(root, &format!(r"{CTX_KEY_BG}\command"), "", &cmd_bg)
+        && reg_set_sz(root, &format!(r"{CTX_KEY_BG}\command"), "", &cmd_bg);
+    // スクリプト（.ps1/.bat/.cmd）右クリックに「LustTermina で実行」を追加。%1 はそのファイル。
+    let cmd_run = format!("\"{exe}\" --run \"%1\"");
+    for ext in SCRIPT_EXTS {
+        let key = script_ctx_key(ext);
+        ok = ok
+            && reg_set_sz(root, &key, "", SCRIPT_RUN_LABEL)
+            && reg_set_sz(root, &key, "Icon", exe)
+            && reg_set_sz(root, &format!(r"{key}\command"), "", &cmd_run);
+    }
+    // 「プログラムから開く」一覧に候補として出す（既定は奪わない。SupportedTypes で対象拡張子の
+    // 「おすすめ」に載せる）。open verb は右クリックの実行と同じ --run。
+    ok = ok
+        && reg_set_sz(root, APP_REG_KEY, "FriendlyAppName", "LustTermina")
+        && reg_set_sz(root, &format!(r"{APP_REG_KEY}\DefaultIcon"), "", exe)
+        && reg_set_sz(root, &format!(r"{APP_REG_KEY}\shell\open\command"), "", &cmd_run);
+    for ext in SCRIPT_EXTS {
+        ok = ok && reg_set_sz(root, &format!(r"{APP_REG_KEY}\SupportedTypes"), ext, "");
+    }
+    ok
 }
 
-// 右クリック登録を解除（自分のキーをツリーごと削除）。
+// 右クリック登録を解除（自分のキーをツリーごと削除）。フォルダ用・スクリプト用の両方。
 fn uninstall_context_menu(root: windows::Win32::System::Registry::HKEY) -> bool {
-    // 両方試みてから結果を返す（片方失敗でももう片方は消す）。
-    let a = reg_delete_tree(root, CTX_KEY_DIR);
-    let b = reg_delete_tree(root, CTX_KEY_BG);
-    a && b
+    // 全て試みてから結果を返す（一部失敗でも残りは消す）。& は非短絡。
+    let mut ok = reg_delete_tree(root, CTX_KEY_DIR) & reg_delete_tree(root, CTX_KEY_BG);
+    for ext in SCRIPT_EXTS {
+        ok &= reg_delete_tree(root, &script_ctx_key(ext));
+    }
+    ok &= reg_delete_tree(root, APP_REG_KEY);
+    ok
 }
 
 // HKCU\<subkey> に DWORD を書く（アンインストール項目の NoModify/NoRepair 用）。
@@ -3772,6 +4021,19 @@ fn running_from_install() -> bool {
         .into_iter()
         .any(|s| installed_exe(s).as_deref() == Some(cur.as_path()))
 }
+// アップグレードで退避された旧 exe（lust_termina.old.exe）を起動時に掃除する。
+// do_install はロック回避のため旧版をリネームで残すが、実行中プロセスは lust_termina.exe
+// なので隣の .old.exe はロックされておらず安全に消せる。インストール先起動時のみ行う。
+fn cleanup_old_exe() {
+    if !running_from_install() {
+        return;
+    }
+    if let Ok(cur) = std::env::current_exe() {
+        if let Some(dir) = cur.parent() {
+            let _ = std::fs::remove_file(dir.join("lust_termina.old.exe"));
+        }
+    }
+}
 // 現在の exe の位置からインストールスコープを判定（アンインストール時に使う）。
 // Program Files 配下なら PC全体、それ以外は このユーザー。
 fn current_install_scope() -> InstallScope {
@@ -3835,6 +4097,12 @@ fn msg_box(
     unsafe { MessageBoxW(None, PCWSTR(t.as_ptr()), PCWSTR(c.as_ptr()), style) }
 }
 
+// はい／いいえの確認（警告アイコン）。はい＝true。破壊的操作の前段に使う。
+fn confirm_yes_no(text: &str, caption: &str) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{IDYES, MB_ICONWARNING, MB_YESNO};
+    msg_box(text, caption, MB_YESNO | MB_ICONWARNING).0 == IDYES.0
+}
+
 // アンインストール確認ダイアログ（TaskDialog）。データ削除はチェックボックスで選ぶ（既定オフ）。
 // 戻り値: None=キャンセル、Some(delete_data)=実行（delete_data はチェック状態）。
 fn ask_uninstall() -> Option<bool> {
@@ -3869,7 +4137,14 @@ fn ask_uninstall() -> Option<bool> {
 }
 
 // スタートメニュー等に .lnk ショートカットを作る（COM: IShellLinkW + IPersistFile）。
-fn create_shortcut(lnk: &std::path::Path, target: &str, workdir: &str, icon: &str) -> bool {
+// args は起動時に渡す引数（アンインストーラ用に "--uninstall" 等。無ければ ""）。
+fn create_shortcut(
+    lnk: &std::path::Path,
+    target: &str,
+    args: &str,
+    workdir: &str,
+    icon: &str,
+) -> bool {
     use windows::core::{Interface, PCWSTR};
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER,
@@ -3877,6 +4152,7 @@ fn create_shortcut(lnk: &std::path::Path, target: &str, workdir: &str, icon: &st
     };
     use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
     let target_w = wide_nul(target);
+    let args_w = wide_nul(args);
     let work_w = wide_nul(workdir);
     let icon_w = wide_nul(icon);
     let lnk_w = wide_nul(&lnk.to_string_lossy());
@@ -3885,6 +4161,7 @@ fn create_shortcut(lnk: &std::path::Path, target: &str, workdir: &str, icon: &st
         let result = (|| -> windows::core::Result<()> {
             let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
             link.SetPath(PCWSTR(target_w.as_ptr()))?;
+            link.SetArguments(PCWSTR(args_w.as_ptr()))?;
             link.SetWorkingDirectory(PCWSTR(work_w.as_ptr()))?;
             link.SetIconLocation(PCWSTR(icon_w.as_ptr()), 0)?;
             let persist: IPersistFile = link.cast()?;
@@ -3943,8 +4220,18 @@ fn do_install(scope: InstallScope) -> bool {
         if let Some(parent) = lnk.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        create_shortcut(&lnk, &exe, &dir_s, &exe);
+        create_shortcut(&lnk, &exe, "", &dir_s, &exe);
     }
+    // インストールフォルダ内にアンインストーラのショートカット（--uninstall を叩く）。
+    // スタートメニューは汚さず、フォルダを開けば必ず目に入る場所に置く。アンインストール時は
+    // フォルダごと消えるので後始末は不要。
+    create_shortcut(
+        &dir.join("Uninstall LustTermina.lnk"),
+        &exe,
+        "--uninstall",
+        &dir_s,
+        &exe,
+    );
     install_context_menu(root, &exe);
     write_uninstall_entry(root, &exe, &dir_s);
     true
@@ -4062,6 +4349,7 @@ fn schedule_dir_deletion(dir: &str) {
 enum Launch {
     Normal,                    // 通常起動：起動タブ定義に従う（未インストールなら導入を促す）
     Cwd(String),               // --cwd <path>：そのフォルダでタブ1枚（起動タブ定義は無視）
+    RunScript(String),         // --run <path>：スクリプトをそのフォルダで実行するタブ1枚
     Install,                   // --install：インストール（先を選ばせて）実行し終了
     Uninstall,                 // --uninstall：アンインストールして終了
     DoInstallMachine,          // --do-install-machine：PC全体へ配置（昇格済みの代行ワーカ）
@@ -4077,6 +4365,11 @@ fn parse_launch<I: Iterator<Item = String>>(mut args: I) -> Launch {
             "--cwd" => {
                 if let Some(p) = args.next() {
                     return Launch::Cwd(p);
+                }
+            }
+            "--run" => {
+                if let Some(p) = args.next() {
+                    return Launch::RunScript(p);
                 }
             }
             "--install" => return Launch::Install,
@@ -4153,7 +4446,13 @@ fn main() -> eframe::Result {
         // Explorer の「このディレクトリで開く」等で2つ目以降が起動されたら、既存インスタンスへ
         // 転送して自分は窓を出さずに終了する。転送先が居なければ通常起動（自分が本体になる）。
         Launch::Cwd(path) => {
-            if ipc_try_forward_cwd(path) {
+            if ipc_try_forward(IPC_VERB_CWD, path) {
+                return Ok(());
+            }
+        }
+        // スクリプト実行も、本体が居れば新タブとして合流させる。居なければ自分が本体になる。
+        Launch::RunScript(path) => {
+            if ipc_try_forward(IPC_VERB_RUN, path) {
                 return Ok(());
             }
         }
@@ -4172,6 +4471,8 @@ fn main() -> eframe::Result {
             }
         }
     }
+    // インストール先から起動した通常ケースでは、アップグレードで退避された旧 exe を掃除する。
+    cleanup_old_exe();
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
         .expect("load window icon");
     let native_options = eframe::NativeOptions {
