@@ -3745,6 +3745,39 @@ fn msg_box(
     unsafe { MessageBoxW(None, PCWSTR(t.as_ptr()), PCWSTR(c.as_ptr()), style) }
 }
 
+// アンインストール確認ダイアログ（TaskDialog）。データ削除はチェックボックスで選ぶ（既定オフ）。
+// 戻り値: None=キャンセル、Some(delete_data)=実行（delete_data はチェック状態）。
+fn ask_uninstall() -> Option<bool> {
+    use windows::core::{BOOL, PCWSTR};
+    use windows::Win32::UI::Controls::{
+        TaskDialogIndirect, TASKDIALOGCONFIG, TDCBF_CANCEL_BUTTON, TDCBF_YES_BUTTON,
+        TDF_ALLOW_DIALOG_CANCELLATION,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::IDYES;
+    let title = wide_nul("LustTermina のアンインストール");
+    let main = wide_nul("LustTermina をアンインストールしますか？");
+    let content =
+        wide_nul("アプリ本体・スタートメニューのショートカット・右クリックの項目を削除します。");
+    let verify = wide_nul("アンインストール時にデータ（設定）も削除する");
+    let mut cfg: TASKDIALOGCONFIG = unsafe { std::mem::zeroed() };
+    cfg.cbSize = std::mem::size_of::<TASKDIALOGCONFIG>() as u32;
+    cfg.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION;
+    cfg.dwCommonButtons = TDCBF_YES_BUTTON | TDCBF_CANCEL_BUTTON;
+    cfg.pszWindowTitle = PCWSTR(title.as_ptr());
+    cfg.pszMainInstruction = PCWSTR(main.as_ptr());
+    cfg.pszContent = PCWSTR(content.as_ptr());
+    cfg.pszVerificationText = PCWSTR(verify.as_ptr());
+    let mut pressed = 0i32;
+    let mut checked = BOOL(0);
+    let ok = unsafe {
+        TaskDialogIndirect(&cfg, Some(&mut pressed), None, Some(&mut checked)).is_ok()
+    };
+    if !ok || pressed != IDYES.0 {
+        return None;
+    }
+    Some(checked.as_bool())
+}
+
 // スタートメニュー等に .lnk ショートカットを作る（COM: IShellLinkW + IPersistFile）。
 fn create_shortcut(lnk: &std::path::Path, target: &str, workdir: &str, icon: &str) -> bool {
     use windows::core::{Interface, PCWSTR};
@@ -3887,7 +3920,7 @@ fn parse_launch<I: Iterator<Item = String>>(mut args: I) -> Launch {
 
 fn main() -> eframe::Result {
     use windows::Win32::UI::WindowsAndMessaging::{
-        IDYES, MB_DEFBUTTON2, MB_ICONINFORMATION, MB_ICONQUESTION, MB_YESNO,
+        IDYES, MB_ICONINFORMATION, MB_ICONQUESTION, MB_YESNO,
     };
     let launch = parse_launch(std::env::args().skip(1));
     // 窓を出さずに完結する起動（インストール系・右クリック登録/解除）は、ここで実行して終了。
@@ -3906,21 +3939,10 @@ fn main() -> eframe::Result {
             std::process::exit(if ok { 0 } else { 1 });
         }
         Launch::Uninstall => {
-            // まず素直に「アンインストールする？」。いいえで中止（破壊的操作を「はい」に紛れさせない）。
-            if msg_box(
-                "LustTermina をアンインストールしますか？",
-                "LustTermina のアンインストール",
-                MB_YESNO | MB_ICONQUESTION,
-            ) != IDYES
-            {
-                return Ok(());
-            }
-            // 次に、設定・データを消すかを独立した二択で。既定ボタンは安全側（いいえ＝残す）。
-            let delete_data = msg_box(
-                "設定・データ（%APPDATA%\\LustTermina）も削除しますか？\n通常は［いいえ］で構いません（設定を残します）。",
-                "設定・データの削除",
-                MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
-            ) == IDYES;
+            // 1枚の TaskDialog で確認＋データ削除の可否（チェックボックス, 既定オフ）を選ぶ。
+            let Some(delete_data) = ask_uninstall() else {
+                return Ok(()); // キャンセル
+            };
             do_uninstall(delete_data);
             // 削除は本体終了後に実行される。ここで静かに終了。
             return Ok(());
