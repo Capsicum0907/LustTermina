@@ -3628,20 +3628,20 @@ fn reg_delete_tree(subkey: &str) -> bool {
     rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND
 }
 
-// 右クリック「LustTermina で開く」を登録。exe の現在位置を指す。
+// 右クリック「LustTermina で開く」を登録。指定した exe パスを指す（インストーラは
+// インストール先を、単独の --install-context-menu は現在の exe を渡す）。
 // フォルダ選択時は %1（そのフォルダ）、背景クリック時は %V（今開いているフォルダ）。
-fn install_context_menu() -> bool {
-    let exe = current_exe_string();
+fn install_context_menu(exe: &str) -> bool {
     if exe.is_empty() {
         return false;
     }
     let cmd_dir = format!("\"{exe}\" --cwd \"%1\"");
     let cmd_bg = format!("\"{exe}\" --cwd \"%V\"");
     reg_set_sz(CTX_KEY_DIR, "", CTX_MENU_LABEL)
-        && reg_set_sz(CTX_KEY_DIR, "Icon", &exe)
+        && reg_set_sz(CTX_KEY_DIR, "Icon", exe)
         && reg_set_sz(&format!(r"{CTX_KEY_DIR}\command"), "", &cmd_dir)
         && reg_set_sz(CTX_KEY_BG, "", CTX_MENU_LABEL)
-        && reg_set_sz(CTX_KEY_BG, "Icon", &exe)
+        && reg_set_sz(CTX_KEY_BG, "Icon", exe)
         && reg_set_sz(&format!(r"{CTX_KEY_BG}\command"), "", &cmd_bg)
 }
 
@@ -3653,13 +3653,217 @@ fn uninstall_context_menu() -> bool {
     a && b
 }
 
+// HKCU\<subkey> に DWORD を書く（アンインストール項目の NoModify/NoRepair 用）。
+fn reg_set_dword(subkey: &str, name: &str, value: u32) -> bool {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_WRITE,
+        REG_DWORD, REG_OPTION_NON_VOLATILE,
+    };
+    let subkey_w = wide_nul(subkey);
+    let name_w = wide_nul(name);
+    let data = value.to_le_bytes();
+    unsafe {
+        let mut hkey = HKEY::default();
+        if RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(subkey_w.as_ptr()),
+            None,
+            PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            None,
+            &mut hkey,
+            None,
+        ) != ERROR_SUCCESS
+        {
+            return false;
+        }
+        let rc = RegSetValueExW(hkey, PCWSTR(name_w.as_ptr()), None, REG_DWORD, Some(&data));
+        let _ = RegCloseKey(hkey);
+        rc == ERROR_SUCCESS
+    }
+}
+
+// ---- 自己インストール（固定パス配置・ショートカット・アンインストール項目）----
+// 外部インストーラを使わず、アプリ自身が --install / --uninstall で入れる/消す。固定パスに
+// 置くのでバージョンが変わってもショートカットや右クリックの参照先は不変（中身だけ差し替え）。
+// アンインストールは書いたものを全部消す（残骸ゼロ）。config は選択式。
+
+// 「アプリと機能」に出すアンインストール項目のキー。
+const UNINSTALL_KEY: &str =
+    r"Software\Microsoft\Windows\CurrentVersion\Uninstall\LustTermina";
+
+// インストール先フォルダ（%LOCALAPPDATA%\Programs\LustTermina）。
+fn install_dir() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")?;
+    Some(std::path::Path::new(&base).join("Programs").join("LustTermina"))
+}
+fn installed_exe() -> Option<std::path::PathBuf> {
+    install_dir().map(|d| d.join("lust_termina.exe"))
+}
+// スタートメニューのショートカット（.lnk）のパス。
+fn start_menu_lnk() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("APPDATA")?;
+    Some(
+        std::path::Path::new(&base)
+            .join("Microsoft")
+            .join("Windows")
+            .join("Start Menu")
+            .join("Programs")
+            .join("LustTermina.lnk"),
+    )
+}
+// 設定・データのフォルダ（%APPDATA%\LustTermina）。config_path() の親。
+fn config_dir() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("APPDATA")?;
+    Some(std::path::Path::new(&base).join("LustTermina"))
+}
+// 今このプロセスがインストール先の exe として動いているか。
+fn running_from_install() -> bool {
+    match (std::env::current_exe().ok(), installed_exe()) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+// インストール済みか（固定パスに exe があるか）。
+fn is_installed() -> bool {
+    installed_exe().map(|p| p.exists()).unwrap_or(false)
+}
+
+// MessageBox（はい/いいえ等）。UX は標準ダイアログのみで完結させ、依存を増やさない。
+fn msg_box(
+    text: &str,
+    caption: &str,
+    style: windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_STYLE,
+) -> windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_RESULT {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::WindowsAndMessaging::MessageBoxW;
+    let t = wide_nul(text);
+    let c = wide_nul(caption);
+    unsafe { MessageBoxW(None, PCWSTR(t.as_ptr()), PCWSTR(c.as_ptr()), style) }
+}
+
+// スタートメニュー等に .lnk ショートカットを作る（COM: IShellLinkW + IPersistFile）。
+fn create_shortcut(lnk: &std::path::Path, target: &str, workdir: &str, icon: &str) -> bool {
+    use windows::core::{Interface, PCWSTR};
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER,
+        COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+    let target_w = wide_nul(target);
+    let work_w = wide_nul(workdir);
+    let icon_w = wide_nul(icon);
+    let lnk_w = wide_nul(&lnk.to_string_lossy());
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let result = (|| -> windows::core::Result<()> {
+            let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
+            link.SetPath(PCWSTR(target_w.as_ptr()))?;
+            link.SetWorkingDirectory(PCWSTR(work_w.as_ptr()))?;
+            link.SetIconLocation(PCWSTR(icon_w.as_ptr()), 0)?;
+            let persist: IPersistFile = link.cast()?;
+            persist.Save(PCWSTR(lnk_w.as_ptr()), true)?;
+            Ok(())
+        })();
+        CoUninitialize();
+        result.is_ok()
+    }
+}
+
+// 「アプリと機能」エントリを書く（UninstallString は本体の --uninstall を指す）。
+fn write_uninstall_entry(exe: &str, dir: &str) -> bool {
+    reg_set_sz(UNINSTALL_KEY, "DisplayName", "LustTermina")
+        && reg_set_sz(UNINSTALL_KEY, "DisplayVersion", env!("CARGO_PKG_VERSION"))
+        && reg_set_sz(UNINSTALL_KEY, "Publisher", "Capsicum0907")
+        && reg_set_sz(UNINSTALL_KEY, "DisplayIcon", exe)
+        && reg_set_sz(UNINSTALL_KEY, "InstallLocation", dir)
+        && reg_set_sz(UNINSTALL_KEY, "UninstallString", &format!("\"{exe}\" --uninstall"))
+        && reg_set_dword(UNINSTALL_KEY, "NoModify", 1)
+        && reg_set_dword(UNINSTALL_KEY, "NoRepair", 1)
+}
+
+// この PC にインストール：固定パスへ配置し、ショートカット・右クリック・アンインストール
+// 項目を登録する。旧版が実行中でロックされていてもリネームで避けて置き換える。
+fn do_install() -> bool {
+    let (Some(dir), Some(dst)) = (install_dir(), installed_exe()) else {
+        return false;
+    };
+    let Ok(src) = std::env::current_exe() else {
+        return false;
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return false;
+    }
+    if src != dst {
+        // 既存 exe が実行中だと上書きコピーは失敗するので、先にリネームして退ける
+        //（実行中でもリネームは可能）。退けた旧版は次回起動時の掃除に任せる。
+        if dst.exists() {
+            let old = dir.join("lust_termina.old.exe");
+            let _ = std::fs::remove_file(&old);
+            let _ = std::fs::rename(&dst, &old);
+        }
+        if std::fs::copy(&src, &dst).is_err() {
+            return false;
+        }
+    }
+    let exe = dst.to_string_lossy().to_string();
+    let dir_s = dir.to_string_lossy().to_string();
+    if let Some(lnk) = start_menu_lnk() {
+        if let Some(parent) = lnk.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        create_shortcut(&lnk, &exe, &dir_s, &exe);
+    }
+    install_context_menu(&exe);
+    write_uninstall_entry(&exe, &dir_s);
+    true
+}
+
+// アンインストール：書いたものを全て消す。delete_config で設定・データも消す（選択式）。
+fn do_uninstall(delete_config: bool) -> bool {
+    uninstall_context_menu();
+    let _ = reg_delete_tree(UNINSTALL_KEY);
+    if let Some(lnk) = start_menu_lnk() {
+        let _ = std::fs::remove_file(lnk);
+    }
+    if delete_config {
+        if let Some(cfg) = config_dir() {
+            let _ = std::fs::remove_dir_all(cfg);
+        }
+    }
+    // 実行中の自分自身（インストール先 exe）はロックされていて消せないので、本体終了を
+    // 少し待ってからフォルダごと削除する小さな外部プロセスを投げておく。
+    if let Some(dir) = install_dir() {
+        schedule_dir_deletion(&dir.to_string_lossy());
+    }
+    true
+}
+
+// 本体終了後にインストールフォルダをまるごと削除する（自己削除）。窓は出さない。
+fn schedule_dir_deletion(dir: &str) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    let line = format!("ping 127.0.0.1 -n 3 >nul & rmdir /s /q \"{dir}\"");
+    let _ = std::process::Command::new("cmd")
+        .arg("/c")
+        .raw_arg(&line)
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+        .spawn();
+}
+
 // 起動時の意図（コマンドライン引数から決まる）。Explorer 連携の入口はここに集約し、
 // 将来 --run <script> やインストール系（--install など）もこの enum に足していく。
 enum Launch {
-    Normal,               // 通常起動：起動タブ定義に従う
+    Normal,               // 通常起動：起動タブ定義に従う（未インストールなら導入を促す）
     Cwd(String),          // --cwd <path>：そのフォルダでタブ1枚（起動タブ定義は無視）
-    InstallContextMenu,   // --install-context-menu：右クリック登録して終了
-    UninstallContextMenu, // --uninstall-context-menu：右クリック解除して終了
+    Install,              // --install：この PC にインストールして終了
+    Uninstall,            // --uninstall：アンインストールして終了
+    InstallContextMenu,   // --install-context-menu：右クリックのみ登録して終了
+    UninstallContextMenu, // --uninstall-context-menu：右クリックのみ解除して終了
 }
 
 // 引数列（プログラム名は除いたもの）を解釈して起動意図を返す。
@@ -3671,6 +3875,8 @@ fn parse_launch<I: Iterator<Item = String>>(mut args: I) -> Launch {
                     return Launch::Cwd(p);
                 }
             }
+            "--install" => return Launch::Install,
+            "--uninstall" => return Launch::Uninstall,
             "--install-context-menu" => return Launch::InstallContextMenu,
             "--uninstall-context-menu" => return Launch::UninstallContextMenu,
             _ => {}
@@ -3680,11 +3886,45 @@ fn parse_launch<I: Iterator<Item = String>>(mut args: I) -> Launch {
 }
 
 fn main() -> eframe::Result {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        IDCANCEL, IDYES, MB_ICONINFORMATION, MB_ICONQUESTION, MB_YESNO, MB_YESNOCANCEL,
+    };
     let launch = parse_launch(std::env::args().skip(1));
-    // 窓を出さずに完結する起動（右クリック登録/解除）は、ここで実行して終了コードで返す。
+    // 窓を出さずに完結する起動（インストール系・右クリック登録/解除）は、ここで実行して終了。
     match &launch {
+        Launch::Install => {
+            let ok = do_install();
+            msg_box(
+                if ok {
+                    "LustTermina をインストールしました。"
+                } else {
+                    "インストールに失敗しました。"
+                },
+                "LustTermina",
+                MB_ICONINFORMATION,
+            );
+            std::process::exit(if ok { 0 } else { 1 });
+        }
+        Launch::Uninstall => {
+            // 確認とデータ削除可否を1つの3択で。はい=データも削除／いいえ=アプリのみ／キャンセル=中止。
+            let r = msg_box(
+                "LustTermina をアンインストールします。\n設定・データ（%APPDATA%\\LustTermina）も削除しますか？\n\n［はい］データも削除　［いいえ］アプリのみ削除　［キャンセル］中止",
+                "LustTermina のアンインストール",
+                MB_YESNOCANCEL | MB_ICONQUESTION,
+            );
+            if r == IDCANCEL {
+                return Ok(());
+            }
+            do_uninstall(r == IDYES);
+            // 削除は本体終了後に実行される。ここで静かに終了。
+            return Ok(());
+        }
         Launch::InstallContextMenu => {
-            std::process::exit(if install_context_menu() { 0 } else { 1 });
+            std::process::exit(if install_context_menu(&current_exe_string()) {
+                0
+            } else {
+                1
+            });
         }
         Launch::UninstallContextMenu => {
             std::process::exit(if uninstall_context_menu() { 0 } else { 1 });
@@ -3696,7 +3936,23 @@ fn main() -> eframe::Result {
                 return Ok(());
             }
         }
-        Launch::Normal => {}
+        Launch::Normal => {
+            // インストール先以外から起動され、まだ未インストールなら導入を促す（初回のぽちぽち）。
+            if !running_from_install() && !is_installed() {
+                let r = msg_box(
+                    "LustTermina をこの PC にインストールしますか？\nスタートメニューのショートカットと、フォルダ右クリックの「LustTermina で開く」を追加します。",
+                    "LustTermina のインストール",
+                    MB_YESNO | MB_ICONQUESTION,
+                );
+                if r == IDYES && do_install() {
+                    // 以後は本体＝インストール版にしたいので、そちらを起動して自分は終了。
+                    if let Some(exe) = installed_exe() {
+                        let _ = std::process::Command::new(exe).spawn();
+                    }
+                    return Ok(());
+                }
+            }
+        }
     }
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
         .expect("load window icon");
