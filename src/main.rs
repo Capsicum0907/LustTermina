@@ -21,7 +21,7 @@ use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color as TermColor, CursorShape, NamedColor, Processor};
 
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
@@ -718,6 +718,9 @@ struct Session {
     // IME 未確定文字列（変換中の合成テキスト）。確定前は pty へ送らずグリッドにも無いので、
     // 描画時にカーソル位置へインライン表示するために保持する。確定/無効化で空に戻す。
     preedit: String,
+    // マウスモーション報告(1002/1003)の重複抑制。同じセル上の移動は1回だけ報告する
+    // （画素ごとに送るとアプリへ洪水になる）。直近に報告したセル(col,row)。
+    last_mouse_cell: Option<(usize, usize)>,
     _child: Box<dyn portable_pty::Child + Send + Sync>,
 }
 
@@ -793,6 +796,7 @@ impl Session {
             shell_short: spec.short.clone(),
             cwd: cwd.to_string(),
             preedit: String::new(),
+            last_mouse_cell: None,
             _child: child,
         }
     }
@@ -809,19 +813,6 @@ impl Session {
         }
     }
 
-    fn handle_scroll(&mut self, wheel: f32, cell_h: f32) {
-        if wheel == 0.0 {
-            return;
-        }
-        self.scroll_accum += wheel / cell_h;
-        let lines = self.scroll_accum.trunc() as i32;
-        if lines != 0 {
-            self.scroll_accum -= lines as f32;
-            if let Ok(mut term) = self.term.lock() {
-                term.scroll_display(Scroll::Delta(lines));
-            }
-        }
-    }
 
     fn send(&self, bytes: &[u8]) {
         if let Ok(mut w) = self.writer.lock() {
@@ -988,7 +979,34 @@ impl Session {
             Err(_) => return,
         };
 
-        // ---- マウスによるテキスト選択（ドラッグで範囲指定）----
+        // 端末側のマウスモード（アプリがマウス操作を要求しているか）を読む。
+        // Claude 等のフルスクリーン TUI は SGR マウスを有効化し、スクロール/クリックを自前処理する。
+        let mode = *term.mode();
+        let mouse_app = mode.intersects(TermMode::MOUSE_MODE); // 1000/1002/1003 のいずれか
+        let sgr = mode.contains(TermMode::SGR_MOUSE);
+        let report_all_motion = mode.contains(TermMode::MOUSE_MOTION); // 1003: 常時モーション
+        let report_btn_motion = mode.contains(TermMode::MOUSE_DRAG); // 1002: ボタン押下中モーション
+        // 代替スクリーンで alt-scroll だけ有効なアプリ（less 等）向けのホイール→↑↓変換。
+        let alt_scroll =
+            mode.contains(TermMode::ALTERNATE_SCROLL) && mode.contains(TermMode::ALT_SCREEN);
+        // Shift 押下中はマウスモードを無視してローカル選択を優先（xterm 慣習）。
+        // これが無いとアプリ起動中に端末側のコピー用選択が一切できなくなる。
+        let shift = ctx.input(|i| i.modifiers.shift);
+        let route_to_app = mouse_app && !shift;
+
+        // 画素→セル（0 始まり・可視範囲にクランプ）。マウスレポートの座標に使う。
+        let to_cell = |p: Pos2| -> (usize, usize) {
+            let cx = (((p.x - origin.x) / cell_w).floor().max(0.0) as usize)
+                .min(cols.saturating_sub(1));
+            let cy = (((p.y - origin.y) / cell_h).floor().max(0.0) as usize)
+                .min(rows.saturating_sub(1));
+            (cx, cy)
+        };
+
+        // pty へ送るバイト列をここに貯め、term ロックを保持したまま最後に一度だけ send する。
+        let mut to_pty: Vec<u8> = Vec::new();
+
+        // ---- テキスト選択（マウスモード外、または Shift 併用時のみ）----
         // 画面座標→グリッド座標。display_offset を引いて履歴含む絶対 Line に戻す。
         // セルの左右どちら寄りかで Side を決める（選択端の包含/除外に効く）。
         let doff = term.grid().display_offset() as i32;
@@ -1001,19 +1019,100 @@ impl Session {
             (Point::new(Line(row - doff), Column(col)), side)
         };
         let pointer = resp.interact_pointer_pos().or_else(|| resp.hover_pos());
-        if resp.drag_started() {
-            if let Some(p) = pointer {
-                let (point, side) = to_point(p);
-                term.selection = Some(Selection::new(SelectionType::Simple, point, side));
+        if !route_to_app {
+            if resp.drag_started() {
+                if let Some(p) = pointer {
+                    let (point, side) = to_point(p);
+                    term.selection = Some(Selection::new(SelectionType::Simple, point, side));
+                }
+            } else if resp.dragged() {
+                if let (Some(p), Some(sel)) = (pointer, term.selection.as_mut()) {
+                    let (point, side) = to_point(p);
+                    sel.update(point, side);
+                }
+            } else if resp.clicked() {
+                // 単クリック（ドラッグ無し）は選択解除
+                term.selection = None;
             }
-        } else if resp.dragged() {
-            if let (Some(p), Some(sel)) = (pointer, term.selection.as_mut()) {
-                let (point, side) = to_point(p);
-                sel.update(point, side);
+        }
+
+        // ---- マウスレポート（アプリへボタン/モーションを転送）----
+        if route_to_app {
+            let events = ctx.input(|i| i.events.clone());
+            for ev in &events {
+                match ev {
+                    egui::Event::PointerButton {
+                        pos,
+                        button,
+                        pressed,
+                        modifiers,
+                    } if rect.contains(*pos) => {
+                        let base = match button {
+                            egui::PointerButton::Primary => 0,
+                            egui::PointerButton::Middle => 1,
+                            egui::PointerButton::Secondary => 2,
+                            _ => continue,
+                        };
+                        let (cx, cy) = to_cell(*pos);
+                        to_pty.extend(mouse_report(sgr, base, cx, cy, modifiers, *pressed));
+                    }
+                    egui::Event::PointerMoved(pos) if rect.contains(*pos) => {
+                        // 押下中のボタン（1002/1003 のモーション基底コード）。無押下は 3。
+                        let (held, any) = ctx.input(|i| {
+                            let p = &i.pointer;
+                            if p.button_down(egui::PointerButton::Primary) {
+                                (0u32, true)
+                            } else if p.button_down(egui::PointerButton::Middle) {
+                                (1, true)
+                            } else if p.button_down(egui::PointerButton::Secondary) {
+                                (2, true)
+                            } else {
+                                (3, false)
+                            }
+                        });
+                        if report_all_motion || (report_btn_motion && any) {
+                            let (cx, cy) = to_cell(*pos);
+                            // 同一セル上の移動は 1 回だけ（画素ごとの洪水を防ぐ）。
+                            if self.last_mouse_cell != Some((cx, cy)) {
+                                self.last_mouse_cell = Some((cx, cy));
+                                let mods = ctx.input(|i| i.modifiers);
+                                to_pty.extend(mouse_report(sgr, held + 32, cx, cy, &mods, true));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
             }
-        } else if resp.clicked() {
-            // 単クリック（ドラッグ無し）は選択解除
-            term.selection = None;
+        }
+
+        // ---- ホイール（モードで振り分け）----
+        // route_to_app: ボタン 64/65 として報告 ／ alt_scroll: ↑↓へ変換 ／ 他: スクロールバック。
+        let wheel = ctx.input(|i| i.smooth_scroll_delta.y);
+        if wheel != 0.0 {
+            self.scroll_accum += wheel / cell_h;
+            let notches = self.scroll_accum.trunc() as i32;
+            if notches != 0 {
+                self.scroll_accum -= notches as f32;
+                if route_to_app {
+                    let (cx, cy) = pointer.map(|p| to_cell(p)).unwrap_or((0, 0));
+                    let mods = ctx.input(|i| i.modifiers);
+                    let btn = if notches > 0 { 64 } else { 65 }; // 上:64 下:65
+                    for _ in 0..notches.abs() {
+                        to_pty.extend(mouse_report(sgr, btn, cx, cy, &mods, true));
+                    }
+                } else if alt_scroll {
+                    let seq: &[u8] = if notches > 0 { b"\x1b[A" } else { b"\x1b[B" };
+                    for _ in 0..notches.abs() {
+                        to_pty.extend_from_slice(seq);
+                    }
+                } else {
+                    term.scroll_display(Scroll::Delta(notches));
+                }
+            }
+        }
+
+        if !to_pty.is_empty() {
+            self.send(&to_pty);
         }
 
         let content = term.renderable_content();
@@ -1193,6 +1292,38 @@ fn setup_fonts(ctx: &egui::Context) {
         }
     }
     ctx.set_fonts(fonts);
+}
+
+// マウスレポートのエスケープ列を1件ぶん組み立てる。
+// cb_base: ボタン基底コード（0=左 1=中 2=右 / 64=ホイール上 65=ホイール下 /
+//          モーションは呼び側で +32 して渡す）。col/row は 0 始まりのセル座標。
+// press=false は SGR ではリリース('m')、X10 では全ボタン解放(3) を意味する。
+fn mouse_report(
+    sgr: bool,
+    cb_base: u32,
+    col: usize,
+    row: usize,
+    m: &egui::Modifiers,
+    press: bool,
+) -> Vec<u8> {
+    // 修飾キーのビット（shift=4, alt/meta=8, ctrl=16）を加算。
+    let mods = (if m.shift { 4 } else { 0 })
+        + (if m.alt { 8 } else { 0 })
+        + (if m.ctrl { 16 } else { 0 });
+    let (cx, cy) = (col + 1, row + 1); // 端末座標は 1 始まり
+    if sgr {
+        // SGR(1006): ESC [ < Cb ; Cx ; Cy  (M=押下 / m=解放)。列/行が 223 を超えても安全。
+        let cb = cb_base + mods;
+        let fin = if press { 'M' } else { 'm' };
+        format!("\x1b[<{cb};{cx};{cy}{fin}").into_bytes()
+    } else {
+        // X10 互換: ESC [ M (Cb+32) (Cx+32) (Cy+32)。解放は全ボタン解放=3。223 超は表現不可。
+        let base = if press { cb_base } else { 3 };
+        let cb = (base + mods + 32).min(255);
+        let x = ((cx as u32) + 32).min(255);
+        let y = ((cy as u32) + 32).min(255);
+        vec![0x1b, b'[', b'M', cb as u8, x as u8, y as u8]
+    }
 }
 
 fn ctrl_letter(key: egui::Key) -> Option<u8> {
@@ -3035,7 +3166,6 @@ impl eframe::App for App {
         let (cw, ch) = ctx.fonts_mut(|f| (f.glyph_width(&font, 'M'), f.row_height(&font)));
         let cell_w = (cw * ppp).round().max(1.0) / ppp;
         let cell_h = (ch * ppp).round().max(1.0) / ppp;
-        let wheel = ctx.input(|i| i.smooth_scroll_delta.y);
 
         // タブ名編集中／確認ダイアログ／設定モーダル表示中は端末入力を止める
         let block_input =
@@ -3048,7 +3178,6 @@ impl eframe::App for App {
             if active.handle_input(&ctx) {
                 active.scroll_to_bottom();
             }
-            active.handle_scroll(wheel, cell_h);
         }
 
         // 中央領域：設定中は設定ページ、通常はアクティブ端末。
