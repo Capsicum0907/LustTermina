@@ -3553,20 +3553,127 @@ fn ipc_start_server(ctx: &egui::Context) -> Option<mpsc::Receiver<String>> {
     Some(rx)
 }
 
+// ---- Explorer 右クリックメニュー登録（レジストリ, HKCU のみ・管理者不要）----
+// 「フォルダを右クリック」= Directory\shell、「フォルダ内の空白を右クリック」= Directory\Background\shell。
+// 書くのは HKCU\Software\Classes 配下の自分のキーだけ（親の shell は共有なので触らない）。
+// アンインストールは自分のキーをツリーごと消す＝残骸ゼロ。Win11 の従来メニュー側（「その他の
+// オプションを確認」）に出る。ラベル・キー名は下の const 一箇所に集約。
+const CTX_MENU_LABEL: &str = "LustTermina で開く";
+const CTX_KEY_DIR: &str = r"Software\Classes\Directory\shell\LustTermina";
+const CTX_KEY_BG: &str = r"Software\Classes\Directory\Background\shell\LustTermina";
+
+// このプロセスの exe の絶対パス（レジストリのコマンド文字列に埋める）。
+fn current_exe_string() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+// UTF-16 のヌル終端ワイド列。
+fn wide_nul(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+// HKCU\<subkey> を作り、(name, value) を REG_SZ で書く。name="" は既定値。
+fn reg_set_sz(subkey: &str, name: &str, value: &str) -> bool {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_WRITE,
+        REG_OPTION_NON_VOLATILE, REG_SZ,
+    };
+    let subkey_w = wide_nul(subkey);
+    let name_w = wide_nul(name);
+    // REG_SZ データは UTF-16LE ＋ 終端NUL をバイト列にしたもの。
+    let data: Vec<u8> = value
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    unsafe {
+        let mut hkey = HKEY::default();
+        let rc = RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(subkey_w.as_ptr()),
+            None,
+            PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            None,
+            &mut hkey,
+            None,
+        );
+        if rc != ERROR_SUCCESS {
+            return false;
+        }
+        let name_ptr = if name.is_empty() {
+            PCWSTR::null()
+        } else {
+            PCWSTR(name_w.as_ptr())
+        };
+        let rc2 = RegSetValueExW(hkey, name_ptr, None, REG_SZ, Some(&data));
+        let _ = RegCloseKey(hkey);
+        rc2 == ERROR_SUCCESS
+    }
+}
+
+// HKCU\<subkey> をツリーごと削除。既に無い場合も成功扱い。
+fn reg_delete_tree(subkey: &str) -> bool {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
+    use windows::Win32::System::Registry::{RegDeleteTreeW, HKEY_CURRENT_USER};
+    let w = wide_nul(subkey);
+    let rc = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(w.as_ptr())) };
+    rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND
+}
+
+// 右クリック「LustTermina で開く」を登録。exe の現在位置を指す。
+// フォルダ選択時は %1（そのフォルダ）、背景クリック時は %V（今開いているフォルダ）。
+fn install_context_menu() -> bool {
+    let exe = current_exe_string();
+    if exe.is_empty() {
+        return false;
+    }
+    let cmd_dir = format!("\"{exe}\" --cwd \"%1\"");
+    let cmd_bg = format!("\"{exe}\" --cwd \"%V\"");
+    reg_set_sz(CTX_KEY_DIR, "", CTX_MENU_LABEL)
+        && reg_set_sz(CTX_KEY_DIR, "Icon", &exe)
+        && reg_set_sz(&format!(r"{CTX_KEY_DIR}\command"), "", &cmd_dir)
+        && reg_set_sz(CTX_KEY_BG, "", CTX_MENU_LABEL)
+        && reg_set_sz(CTX_KEY_BG, "Icon", &exe)
+        && reg_set_sz(&format!(r"{CTX_KEY_BG}\command"), "", &cmd_bg)
+}
+
+// 右クリック登録を解除（自分のキーをツリーごと削除）。
+fn uninstall_context_menu() -> bool {
+    // 両方試みてから結果を返す（片方失敗でももう片方は消す）。
+    let a = reg_delete_tree(CTX_KEY_DIR);
+    let b = reg_delete_tree(CTX_KEY_BG);
+    a && b
+}
+
 // 起動時の意図（コマンドライン引数から決まる）。Explorer 連携の入口はここに集約し、
 // 将来 --run <script> やインストール系（--install など）もこの enum に足していく。
 enum Launch {
-    Normal,      // 通常起動：起動タブ定義に従う
-    Cwd(String), // --cwd <path>：そのフォルダでタブ1枚（起動タブ定義は無視）
+    Normal,               // 通常起動：起動タブ定義に従う
+    Cwd(String),          // --cwd <path>：そのフォルダでタブ1枚（起動タブ定義は無視）
+    InstallContextMenu,   // --install-context-menu：右クリック登録して終了
+    UninstallContextMenu, // --uninstall-context-menu：右クリック解除して終了
 }
 
 // 引数列（プログラム名は除いたもの）を解釈して起動意図を返す。
 fn parse_launch<I: Iterator<Item = String>>(mut args: I) -> Launch {
     while let Some(a) = args.next() {
-        if a == "--cwd" {
-            if let Some(p) = args.next() {
-                return Launch::Cwd(p);
+        match a.as_str() {
+            "--cwd" => {
+                if let Some(p) = args.next() {
+                    return Launch::Cwd(p);
+                }
             }
+            "--install-context-menu" => return Launch::InstallContextMenu,
+            "--uninstall-context-menu" => return Launch::UninstallContextMenu,
+            _ => {}
         }
     }
     Launch::Normal
@@ -3574,12 +3681,22 @@ fn parse_launch<I: Iterator<Item = String>>(mut args: I) -> Launch {
 
 fn main() -> eframe::Result {
     let launch = parse_launch(std::env::args().skip(1));
-    // Explorer の「このディレクトリで開く」等で2つ目以降が起動されたら、既存インスタンスへ
-    // 転送して自分は窓を出さずに終了する。転送先が居なければ通常起動（自分が本体になる）。
-    if let Launch::Cwd(path) = &launch {
-        if ipc_try_forward_cwd(path) {
-            return Ok(());
+    // 窓を出さずに完結する起動（右クリック登録/解除）は、ここで実行して終了コードで返す。
+    match &launch {
+        Launch::InstallContextMenu => {
+            std::process::exit(if install_context_menu() { 0 } else { 1 });
         }
+        Launch::UninstallContextMenu => {
+            std::process::exit(if uninstall_context_menu() { 0 } else { 1 });
+        }
+        // Explorer の「このディレクトリで開く」等で2つ目以降が起動されたら、既存インスタンスへ
+        // 転送して自分は窓を出さずに終了する。転送先が居なければ通常起動（自分が本体になる）。
+        Launch::Cwd(path) => {
+            if ipc_try_forward_cwd(path) {
+                return Ok(());
+            }
+        }
+        Launch::Normal => {}
     }
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
         .expect("load window icon");
