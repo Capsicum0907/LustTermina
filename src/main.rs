@@ -715,6 +715,9 @@ struct Session {
     accent: Color32, // このタブのアクセント色（既定は緑）
     shell_short: String, // 開いたシェルの short 名（起動タブのスナップショット用）
     cwd: String,         // 開いた初期ディレクトリ（同上。空=継承）
+    // IME 未確定文字列（変換中の合成テキスト）。確定前は pty へ送らずグリッドにも無いので、
+    // 描画時にカーソル位置へインライン表示するために保持する。確定/無効化で空に戻す。
+    preedit: String,
     _child: Box<dyn portable_pty::Child + Send + Sync>,
 }
 
@@ -789,6 +792,7 @@ impl Session {
             accent: ACCENT_GREEN,
             shell_short: spec.short.clone(),
             cwd: cwd.to_string(),
+            preedit: String::new(),
             _child: child,
         }
     }
@@ -828,7 +832,7 @@ impl Session {
 
     // egui の入力イベントを pty 向けバイト列に変換して送る
     // 入力を pty へ。何か送ったら true（呼び元が最下部へスナップするのに使う）
-    fn handle_input(&self, ctx: &egui::Context) -> bool {
+    fn handle_input(&mut self, ctx: &egui::Context) -> bool {
         use egui::{Event, ImeEvent, Key};
         let events = ctx.input(|i| i.events.clone());
         let mut sent = false;
@@ -839,9 +843,17 @@ impl Session {
                     self.send(t.as_bytes());
                     sent = true;
                 }
-                // IME 確定（日本語など）。egui-winit が Commit で渡す
+                // IME 変換中の未確定文字列。まだ確定していないので pty へは送らず、
+                // 合成テキストとして保持だけする（描画側がカーソル位置に表示）。
+                // 空文字列は「IME 解除」を意味するので、そのまま preedit が空に戻る。
+                Event::Ime(ImeEvent::Preedit { text, .. }) => {
+                    self.preedit = text;
+                }
+                // IME 確定（日本語など）。egui-winit が Commit で渡す。
+                // 確定したら合成テキストは用済みなので消す。
                 Event::Ime(ImeEvent::Commit(t)) => {
                     self.send(t.as_bytes());
+                    self.preedit.clear();
                     sent = true;
                 }
                 // ペースト（Ctrl+V は Key ではなくこのイベントで届く）。改行は CR に
@@ -1111,13 +1123,34 @@ impl Session {
             painter.rect_filled(crect, 0.0, Color32::from_white_alpha(96));
         }
 
+        // IME 未確定文字列（変換中の合成テキスト）をカーソル位置にインライン表示。
+        // まだ pty へ送っておらずグリッドに無いので、ここで直に描く。下線＝未確定の合図。
+        // 候補窓は合成テキストの末尾に出したいので、その分の表示幅を測って基準を右へ送る。
+        let mut ime_anchor = crect;
+        if allow_ime && !self.preedit.is_empty() {
+            let text = self.preedit.clone();
+            // 全角/半角混在に対応するため、実グリフ幅の総和で表示幅を求める。
+            let w: f32 = ctx.fonts_mut(|f| text.chars().map(|c| f.glyph_width(font, c)).sum());
+            let pre_rect = egui::Rect::from_min_size(cpos, Vec2::new(w.max(cell_w), cell_h));
+            // 端末地で塗り直してから合成テキストを重ね、下線で未確定を示す。
+            painter.rect_filled(pre_rect, 0.0, body_bg);
+            painter.text(cpos, Align2::LEFT_TOP, &text, font.clone(), DEFAULT_FG);
+            painter.hline(
+                egui::Rangef::new(cpos.x, cpos.x + w),
+                cpos.y + cell_h - 1.5,
+                egui::Stroke::new(1.0, DEFAULT_FG),
+            );
+            ime_anchor =
+                egui::Rect::from_min_size(Pos2::new(cpos.x + w, cpos.y), Vec2::new(cell_w, cell_h));
+        }
+
         // IME を毎フレーム有効化（ime=Some で winit が set_ime_allowed(true)）。
-        // 候補窓はカーソルセルに出す。タブ名編集中は欄側に譲るので出さない。
+        // 候補窓は合成テキスト末尾（無ければカーソルセル）に出す。タブ名編集中は欄側に譲る。
         if allow_ime {
             ctx.output_mut(|o| {
                 o.ime = Some(egui::output::IMEOutput {
-                    rect: crect,
-                    cursor_rect: crect,
+                    rect: ime_anchor,
+                    cursor_rect: ime_anchor,
                     should_interrupt_composition: false,
                 });
             });
