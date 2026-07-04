@@ -10,6 +10,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::io::{Read, Write};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -1531,6 +1532,8 @@ struct App {
     startup_color_open: Option<(usize, bool)>, // 色パレットを開いているカード（bool=accent）
     card_drag: Option<TabDrag>,        // 起動タブカードの D&D 並べ替え状態
     toast: Option<(String, std::time::Instant)>, // 一時通知（保存しました 等）
+    // 別インスタンスから転送された「このフォルダで開く」要求の受信口（本体のみ Some）。
+    ipc_rx: Option<mpsc::Receiver<String>>,
 }
 
 impl App {
@@ -1674,7 +1677,26 @@ impl App {
             startup_color_open: None,
             card_drag: None,
             toast: None,
+            // 受け口の生成に成功した（＝このプロセスが本体の）ときだけ Some。
+            ipc_rx: ipc_start_server(&cc.egui_ctx),
         }
+    }
+
+    // 別インスタンスからの「このフォルダで開く」要求を、既定シェルの新規タブとして開く。
+    fn open_dir_tab(&mut self, ctx: &egui::Context, dir: &str) {
+        let spec = self.shells[self.default_shell].clone();
+        let id = self.next_id;
+        self.next_id += 1;
+        let title = std::path::Path::new(dir)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{} {}", spec.short, id));
+        let mut sess = Session::spawn(ctx, title, &spec, dir);
+        sess.bg = self.default_bg;
+        sess.accent = self.default_accent;
+        self.sessions.push(sess);
+        self.active = self.sessions.len() - 1;
     }
 
     // 一時通知を出す（数秒で自動的に消える）。
@@ -2953,6 +2975,16 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
+        // 別インスタンスから転送された「このフォルダで開く」要求を取り込む。
+        // 借用を切るため一旦集めてから開く（open_dir_tab が self を可変借用するため）。
+        if self.ipc_rx.is_some() {
+            let dirs: Vec<String> =
+                self.ipc_rx.as_ref().map(|rx| rx.try_iter().collect()).unwrap_or_default();
+            for d in dirs {
+                self.open_dir_tab(&ctx, &d);
+            }
+        }
+
         // Ctrl+Tab で一つ下、Ctrl+Shift+Tab で一つ上のタブへ（端は循環）
         let n = self.sessions.len();
         if n > 0 && self.editing.is_none() && self.confirm_close.is_none() && !self.settings_open {
@@ -3409,6 +3441,118 @@ impl eframe::App for App {
     }
 }
 
+// ---- 単一インスタンス & プロセス間通信（Windows 名前付きパイプ）----
+// Explorer の「このディレクトリで開く」等で2つ目以降のプロセスが起動されたら、既に動いて
+// いる本体へパスを送って自分は終了する。本体は受け口の名前付きパイプを1本だけ張り、届いた
+// パスを UI スレッドへ渡して新規タブを開く。パイプは nMaxInstances=1 で作るので、2つ目の
+// 生成は失敗する＝「本体が居るか」の判定を兼ねる。依存は増やさず、既に使っている windows
+// クレート（＋Win32_System_Pipes 機能）だけで実装する。
+
+// メッセージ書式は <verb>\t<payload>。将来 --run 等の verb を足せるようにしておく。
+const IPC_VERB_CWD: &str = "cwd";
+
+// パイプ名。別ユーザーと衝突しないようユーザー名で分ける（per-user）。
+fn ipc_pipe_name() -> Vec<u16> {
+    let user = std::env::var("USERNAME").unwrap_or_default();
+    format!(r"\\.\pipe\LustTermina.{user}")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+// 既存インスタンスへ「このフォルダで開く」を転送。本体が受け取れたら true、居なければ false。
+fn ipc_try_forward_cwd(path: &str) -> bool {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, GENERIC_WRITE};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, WriteFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE, OPEN_EXISTING,
+    };
+    let name = ipc_pipe_name();
+    unsafe {
+        let handle = match CreateFileW(
+            PCWSTR(name.as_ptr()),
+            GENERIC_WRITE.0,
+            FILE_SHARE_MODE(0),
+            None,
+            OPEN_EXISTING,
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            None,
+        ) {
+            Ok(h) => h,
+            Err(_) => return false, // 本体が居ない（パイプ無し）
+        };
+        let msg = format!("{IPC_VERB_CWD}\t{path}");
+        let ok = WriteFile(handle, Some(msg.as_bytes()), None, None).is_ok();
+        let _ = CloseHandle(handle);
+        ok
+    }
+}
+
+// 受け口（サーバ）を1本だけ張る。既に他インスタンスが持っていれば None＝自分は本体でない。
+// 本体なら常駐スレッドでクライアントを順に捌き、受信したパスを Receiver 経由で UI に渡す。
+fn ipc_start_server(ctx: &egui::Context) -> Option<mpsc::Receiver<String>> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+    use windows::Win32::Storage::FileSystem::{ReadFile, PIPE_ACCESS_INBOUND};
+    use windows::Win32::System::Pipes::{
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
+        PIPE_TYPE_BYTE, PIPE_WAIT,
+    };
+    let name = ipc_pipe_name();
+    // CreateNamedPipeW は生 HANDLE を返し、失敗時は INVALID_HANDLE_VALUE。
+    let handle = unsafe {
+        CreateNamedPipeW(
+            PCWSTR(name.as_ptr()),
+            PIPE_ACCESS_INBOUND,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            1, // nMaxInstances=1：2つ目の生成失敗＝単一インスタンス判定を兼ねる
+            0,
+            8192,
+            0,
+            None,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return None; // 既に本体が居る（受け口は張らない）
+    }
+    let (tx, rx) = mpsc::channel::<String>();
+    let ctx = ctx.clone();
+    let raw = handle.0 as isize; // HANDLE は Send でないので数値で運ぶ
+    thread::spawn(move || {
+        let handle = HANDLE(raw as *mut core::ffi::c_void);
+        loop {
+            // クライアント接続待ち（既に接続済みのエラーも捌きたいので結果は無視）。
+            unsafe {
+                let _ = ConnectNamedPipe(handle, None);
+            }
+            let mut msg = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                let mut read = 0u32;
+                let ok = unsafe {
+                    ReadFile(handle, Some(&mut buf), Some(&mut read as *mut u32), None).is_ok()
+                };
+                if !ok || read == 0 {
+                    break;
+                }
+                msg.extend_from_slice(&buf[..read as usize]);
+            }
+            unsafe {
+                let _ = DisconnectNamedPipe(handle);
+            }
+            if let Ok(s) = String::from_utf8(msg) {
+                if let Some(path) = s.strip_prefix(&format!("{IPC_VERB_CWD}\t")) {
+                    if !path.is_empty() {
+                        let _ = tx.send(path.to_string());
+                        ctx.request_repaint();
+                    }
+                }
+            }
+        }
+    });
+    Some(rx)
+}
+
 // 起動時の意図（コマンドライン引数から決まる）。Explorer 連携の入口はここに集約し、
 // 将来 --run <script> やインストール系（--install など）もこの enum に足していく。
 enum Launch {
@@ -3430,6 +3574,13 @@ fn parse_launch<I: Iterator<Item = String>>(mut args: I) -> Launch {
 
 fn main() -> eframe::Result {
     let launch = parse_launch(std::env::args().skip(1));
+    // Explorer の「このディレクトリで開く」等で2つ目以降が起動されたら、既存インスタンスへ
+    // 転送して自分は窓を出さずに終了する。転送先が居なければ通常起動（自分が本体になる）。
+    if let Launch::Cwd(path) = &launch {
+        if ipc_try_forward_cwd(path) {
+            return Ok(());
+        }
+    }
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
         .expect("load window icon");
     let native_options = eframe::NativeOptions {
