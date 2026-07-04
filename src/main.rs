@@ -3575,13 +3575,19 @@ fn wide_nul(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-// HKCU\<subkey> を作り、(name, value) を REG_SZ で書く。name="" は既定値。
-fn reg_set_sz(subkey: &str, name: &str, value: &str) -> bool {
+// <root>\<subkey> を作り、(name, value) を REG_SZ で書く。name="" は既定値。
+// root は HKCU（このユーザー）か HKLM（PC全体）を渡す。
+fn reg_set_sz(
+    root: windows::Win32::System::Registry::HKEY,
+    subkey: &str,
+    name: &str,
+    value: &str,
+) -> bool {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::ERROR_SUCCESS;
     use windows::Win32::System::Registry::{
-        RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_WRITE,
-        REG_OPTION_NON_VOLATILE, REG_SZ,
+        RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, KEY_WRITE, REG_OPTION_NON_VOLATILE,
+        REG_SZ,
     };
     let subkey_w = wide_nul(subkey);
     let name_w = wide_nul(name);
@@ -3594,7 +3600,7 @@ fn reg_set_sz(subkey: &str, name: &str, value: &str) -> bool {
     unsafe {
         let mut hkey = HKEY::default();
         let rc = RegCreateKeyExW(
-            HKEY_CURRENT_USER,
+            root,
             PCWSTR(subkey_w.as_ptr()),
             None,
             PCWSTR::null(),
@@ -3618,48 +3624,53 @@ fn reg_set_sz(subkey: &str, name: &str, value: &str) -> bool {
     }
 }
 
-// HKCU\<subkey> をツリーごと削除。既に無い場合も成功扱い。
-fn reg_delete_tree(subkey: &str) -> bool {
+// <root>\<subkey> をツリーごと削除。既に無い場合も成功扱い。
+fn reg_delete_tree(root: windows::Win32::System::Registry::HKEY, subkey: &str) -> bool {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
-    use windows::Win32::System::Registry::{RegDeleteTreeW, HKEY_CURRENT_USER};
+    use windows::Win32::System::Registry::RegDeleteTreeW;
     let w = wide_nul(subkey);
-    let rc = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(w.as_ptr())) };
+    let rc = unsafe { RegDeleteTreeW(root, PCWSTR(w.as_ptr())) };
     rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND
 }
 
 // 右クリック「LustTermina で開く」を登録。指定した exe パスを指す（インストーラは
 // インストール先を、単独の --install-context-menu は現在の exe を渡す）。
 // フォルダ選択時は %1（そのフォルダ）、背景クリック時は %V（今開いているフォルダ）。
-fn install_context_menu(exe: &str) -> bool {
+fn install_context_menu(root: windows::Win32::System::Registry::HKEY, exe: &str) -> bool {
     if exe.is_empty() {
         return false;
     }
     let cmd_dir = format!("\"{exe}\" --cwd \"%1\"");
     let cmd_bg = format!("\"{exe}\" --cwd \"%V\"");
-    reg_set_sz(CTX_KEY_DIR, "", CTX_MENU_LABEL)
-        && reg_set_sz(CTX_KEY_DIR, "Icon", exe)
-        && reg_set_sz(&format!(r"{CTX_KEY_DIR}\command"), "", &cmd_dir)
-        && reg_set_sz(CTX_KEY_BG, "", CTX_MENU_LABEL)
-        && reg_set_sz(CTX_KEY_BG, "Icon", exe)
-        && reg_set_sz(&format!(r"{CTX_KEY_BG}\command"), "", &cmd_bg)
+    reg_set_sz(root, CTX_KEY_DIR, "", CTX_MENU_LABEL)
+        && reg_set_sz(root, CTX_KEY_DIR, "Icon", exe)
+        && reg_set_sz(root, &format!(r"{CTX_KEY_DIR}\command"), "", &cmd_dir)
+        && reg_set_sz(root, CTX_KEY_BG, "", CTX_MENU_LABEL)
+        && reg_set_sz(root, CTX_KEY_BG, "Icon", exe)
+        && reg_set_sz(root, &format!(r"{CTX_KEY_BG}\command"), "", &cmd_bg)
 }
 
 // 右クリック登録を解除（自分のキーをツリーごと削除）。
-fn uninstall_context_menu() -> bool {
+fn uninstall_context_menu(root: windows::Win32::System::Registry::HKEY) -> bool {
     // 両方試みてから結果を返す（片方失敗でももう片方は消す）。
-    let a = reg_delete_tree(CTX_KEY_DIR);
-    let b = reg_delete_tree(CTX_KEY_BG);
+    let a = reg_delete_tree(root, CTX_KEY_DIR);
+    let b = reg_delete_tree(root, CTX_KEY_BG);
     a && b
 }
 
 // HKCU\<subkey> に DWORD を書く（アンインストール項目の NoModify/NoRepair 用）。
-fn reg_set_dword(subkey: &str, name: &str, value: u32) -> bool {
+fn reg_set_dword(
+    root: windows::Win32::System::Registry::HKEY,
+    subkey: &str,
+    name: &str,
+    value: u32,
+) -> bool {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::ERROR_SUCCESS;
     use windows::Win32::System::Registry::{
-        RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_WRITE,
-        REG_DWORD, REG_OPTION_NON_VOLATILE,
+        RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, KEY_WRITE, REG_DWORD,
+        REG_OPTION_NON_VOLATILE,
     };
     let subkey_w = wide_nul(subkey);
     let name_w = wide_nul(name);
@@ -3667,7 +3678,7 @@ fn reg_set_dword(subkey: &str, name: &str, value: u32) -> bool {
     unsafe {
         let mut hkey = HKEY::default();
         if RegCreateKeyExW(
-            HKEY_CURRENT_USER,
+            root,
             PCWSTR(subkey_w.as_ptr()),
             None,
             PCWSTR::null(),
@@ -3695,17 +3706,43 @@ fn reg_set_dword(subkey: &str, name: &str, value: u32) -> bool {
 const UNINSTALL_KEY: &str =
     r"Software\Microsoft\Windows\CurrentVersion\Uninstall\LustTermina";
 
-// インストール先フォルダ（%LOCALAPPDATA%\Programs\LustTermina）。
-fn install_dir() -> Option<std::path::PathBuf> {
-    let base = std::env::var_os("LOCALAPPDATA")?;
-    Some(std::path::Path::new(&base).join("Programs").join("LustTermina"))
+// インストールのスコープ（このユーザーだけ / PC全体）。PC全体は管理者権限が要る。
+#[derive(Clone, Copy, PartialEq)]
+enum InstallScope {
+    PerUser, // %LOCALAPPDATA% ＋ HKCU（UAC 不要）
+    Machine, // %ProgramFiles% ＋ HKLM（UAC 必要）
 }
-fn installed_exe() -> Option<std::path::PathBuf> {
-    install_dir().map(|d| d.join("lust_termina.exe"))
+
+// スコープに対応するレジストリのルート。
+fn scope_root(scope: InstallScope) -> windows::Win32::System::Registry::HKEY {
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    match scope {
+        InstallScope::PerUser => HKEY_CURRENT_USER,
+        InstallScope::Machine => HKEY_LOCAL_MACHINE,
+    }
 }
-// スタートメニューのショートカット（.lnk）のパス。
-fn start_menu_lnk() -> Option<std::path::PathBuf> {
-    let base = std::env::var_os("APPDATA")?;
+
+// インストール先フォルダ。PerUser=%LOCALAPPDATA%\Programs\LustTermina / Machine=%ProgramFiles%\LustTermina。
+fn install_dir(scope: InstallScope) -> Option<std::path::PathBuf> {
+    let base = match scope {
+        InstallScope::PerUser => std::env::var_os("LOCALAPPDATA")?,
+        InstallScope::Machine => std::env::var_os("ProgramFiles")?,
+    };
+    let p = std::path::Path::new(&base);
+    Some(match scope {
+        InstallScope::PerUser => p.join("Programs").join("LustTermina"),
+        InstallScope::Machine => p.join("LustTermina"),
+    })
+}
+fn installed_exe(scope: InstallScope) -> Option<std::path::PathBuf> {
+    install_dir(scope).map(|d| d.join("lust_termina.exe"))
+}
+// スタートメニューのショートカット（.lnk）。PerUser=自分用 / Machine=全ユーザー用。
+fn start_menu_lnk(scope: InstallScope) -> Option<std::path::PathBuf> {
+    let base = match scope {
+        InstallScope::PerUser => std::env::var_os("APPDATA")?,
+        InstallScope::Machine => std::env::var_os("ProgramData")?,
+    };
     Some(
         std::path::Path::new(&base)
             .join("Microsoft")
@@ -3715,21 +3752,74 @@ fn start_menu_lnk() -> Option<std::path::PathBuf> {
             .join("LustTermina.lnk"),
     )
 }
-// 設定・データのフォルダ（%APPDATA%\LustTermina）。config_path() の親。
+// 設定・データのフォルダ（%APPDATA%\LustTermina）。スコープに依らず常にユーザー配下。
 fn config_dir() -> Option<std::path::PathBuf> {
     let base = std::env::var_os("APPDATA")?;
     Some(std::path::Path::new(&base).join("LustTermina"))
 }
-// 今このプロセスがインストール先の exe として動いているか。
+// どちらかのスコープでインストール済みなら、そのスコープを返す（PC全体を優先）。
+fn installed_scope() -> Option<InstallScope> {
+    [InstallScope::Machine, InstallScope::PerUser]
+        .into_iter()
+        .find(|&s| installed_exe(s).map(|p| p.exists()).unwrap_or(false))
+}
+// 今このプロセスがどちらかのインストール先 exe として動いているか。
 fn running_from_install() -> bool {
-    match (std::env::current_exe().ok(), installed_exe()) {
-        (Some(a), Some(b)) => a == b,
-        _ => false,
+    let Ok(cur) = std::env::current_exe() else {
+        return false;
+    };
+    [InstallScope::Machine, InstallScope::PerUser]
+        .into_iter()
+        .any(|s| installed_exe(s).as_deref() == Some(cur.as_path()))
+}
+// 現在の exe の位置からインストールスコープを判定（アンインストール時に使う）。
+// Program Files 配下なら PC全体、それ以外は このユーザー。
+fn current_install_scope() -> InstallScope {
+    match (std::env::current_exe(), install_dir(InstallScope::Machine)) {
+        (Ok(cur), Some(m)) if cur.starts_with(&m) => InstallScope::Machine,
+        _ => InstallScope::PerUser,
     }
 }
-// インストール済みか（固定パスに exe があるか）。
-fn is_installed() -> bool {
-    installed_exe().map(|p| p.exists()).unwrap_or(false)
+// 管理者権限で動いているか。
+fn is_elevated() -> bool {
+    use windows::Win32::UI::Shell::IsUserAnAdmin;
+    unsafe { IsUserAnAdmin().as_bool() }
+}
+// 自分自身を管理者として起動し直す（UAC）。指定引数で走らせ、終了を待って成否を返す。
+// 未署名なので UAC は「発行元不明」の警告付きプロンプトになる。
+fn relaunch_elevated(args: &str) -> bool {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
+    use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let exe_w = wide_nul(&exe.to_string_lossy());
+    let verb = wide_nul("runas");
+    let params = wide_nul(args);
+    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    info.fMask = SEE_MASK_NOCLOSEPROCESS;
+    info.lpVerb = PCWSTR(verb.as_ptr());
+    info.lpFile = PCWSTR(exe_w.as_ptr());
+    info.lpParameters = PCWSTR(params.as_ptr());
+    info.nShow = SW_SHOWNORMAL.0;
+    unsafe {
+        if ShellExecuteExW(&mut info).is_err() {
+            return false; // ユーザーが UAC を拒否した等
+        }
+        let h = info.hProcess;
+        if h.is_invalid() {
+            return false;
+        }
+        WaitForSingleObject(h, INFINITE);
+        let mut code = 1u32;
+        let _ = GetExitCodeProcess(h, &mut code);
+        let _ = CloseHandle(h);
+        code == 0
+    }
 }
 
 // MessageBox（はい/いいえ等）。UX は標準ダイアログのみで完結させ、依存を増やさない。
@@ -3807,21 +3897,25 @@ fn create_shortcut(lnk: &std::path::Path, target: &str, workdir: &str, icon: &st
 }
 
 // 「アプリと機能」エントリを書く（UninstallString は本体の --uninstall を指す）。
-fn write_uninstall_entry(exe: &str, dir: &str) -> bool {
-    reg_set_sz(UNINSTALL_KEY, "DisplayName", "LustTermina")
-        && reg_set_sz(UNINSTALL_KEY, "DisplayVersion", env!("CARGO_PKG_VERSION"))
-        && reg_set_sz(UNINSTALL_KEY, "Publisher", "Capsicum0907")
-        && reg_set_sz(UNINSTALL_KEY, "DisplayIcon", exe)
-        && reg_set_sz(UNINSTALL_KEY, "InstallLocation", dir)
-        && reg_set_sz(UNINSTALL_KEY, "UninstallString", &format!("\"{exe}\" --uninstall"))
-        && reg_set_dword(UNINSTALL_KEY, "NoModify", 1)
-        && reg_set_dword(UNINSTALL_KEY, "NoRepair", 1)
+fn write_uninstall_entry(
+    root: windows::Win32::System::Registry::HKEY,
+    exe: &str,
+    dir: &str,
+) -> bool {
+    reg_set_sz(root, UNINSTALL_KEY, "DisplayName", "LustTermina")
+        && reg_set_sz(root, UNINSTALL_KEY, "DisplayVersion", env!("CARGO_PKG_VERSION"))
+        && reg_set_sz(root, UNINSTALL_KEY, "Publisher", "Capsicum0907")
+        && reg_set_sz(root, UNINSTALL_KEY, "DisplayIcon", exe)
+        && reg_set_sz(root, UNINSTALL_KEY, "InstallLocation", dir)
+        && reg_set_sz(root, UNINSTALL_KEY, "UninstallString", &format!("\"{exe}\" --uninstall"))
+        && reg_set_dword(root, UNINSTALL_KEY, "NoModify", 1)
+        && reg_set_dword(root, UNINSTALL_KEY, "NoRepair", 1)
 }
 
-// この PC にインストール：固定パスへ配置し、ショートカット・右クリック・アンインストール
-// 項目を登録する。旧版が実行中でロックされていてもリネームで避けて置き換える。
-fn do_install() -> bool {
-    let (Some(dir), Some(dst)) = (install_dir(), installed_exe()) else {
+// 指定スコープへ実際に配置・登録する（PC全体スコープなら管理者権限で呼ばれている前提）。
+// 旧版が実行中でロックされていてもリネームで避けて置き換える。
+fn do_install(scope: InstallScope) -> bool {
+    let (Some(dir), Some(dst)) = (install_dir(scope), installed_exe(scope)) else {
         return false;
     };
     let Ok(src) = std::env::current_exe() else {
@@ -3844,22 +3938,25 @@ fn do_install() -> bool {
     }
     let exe = dst.to_string_lossy().to_string();
     let dir_s = dir.to_string_lossy().to_string();
-    if let Some(lnk) = start_menu_lnk() {
+    let root = scope_root(scope);
+    if let Some(lnk) = start_menu_lnk(scope) {
         if let Some(parent) = lnk.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         create_shortcut(&lnk, &exe, &dir_s, &exe);
     }
-    install_context_menu(&exe);
-    write_uninstall_entry(&exe, &dir_s);
+    install_context_menu(root, &exe);
+    write_uninstall_entry(root, &exe, &dir_s);
     true
 }
 
-// アンインストール：書いたものを全て消す。delete_config で設定・データも消す（選択式）。
-fn do_uninstall(delete_config: bool) -> bool {
-    uninstall_context_menu();
-    let _ = reg_delete_tree(UNINSTALL_KEY);
-    if let Some(lnk) = start_menu_lnk() {
+// 指定スコープの登録物を全て消す。delete_config で設定・データも消す（選択式）。
+// PC全体スコープなら管理者権限で呼ばれている前提。
+fn do_uninstall(scope: InstallScope, delete_config: bool) -> bool {
+    let root = scope_root(scope);
+    uninstall_context_menu(root);
+    let _ = reg_delete_tree(root, UNINSTALL_KEY);
+    if let Some(lnk) = start_menu_lnk(scope) {
         let _ = std::fs::remove_file(lnk);
     }
     if delete_config {
@@ -3869,10 +3966,82 @@ fn do_uninstall(delete_config: bool) -> bool {
     }
     // 実行中の自分自身（インストール先 exe）はロックされていて消せないので、本体終了を
     // 少し待ってからフォルダごと削除する小さな外部プロセスを投げておく。
-    if let Some(dir) = install_dir() {
+    if let Some(dir) = install_dir(scope) {
         schedule_dir_deletion(&dir.to_string_lossy());
     }
     true
+}
+
+// インストールを実行。PC全体スコープで未昇格なら、UAC で自分を昇格し直して代行させる。
+fn perform_install(scope: InstallScope) -> bool {
+    if scope == InstallScope::Machine && !is_elevated() {
+        relaunch_elevated("--do-install-machine")
+    } else {
+        do_install(scope)
+    }
+}
+
+// アンインストールを実行。PC全体スコープで未昇格なら UAC 昇格して代行させる。
+fn perform_uninstall(scope: InstallScope, delete_config: bool) -> bool {
+    if scope == InstallScope::Machine && !is_elevated() {
+        relaunch_elevated(&format!(
+            "--do-uninstall-machine {}",
+            if delete_config { 1 } else { 0 }
+        ))
+    } else {
+        do_uninstall(scope, delete_config)
+    }
+}
+
+// インストール確認＋インストール先の選択（TaskDialog のラジオボタン）。
+// 戻り値: None=キャンセル、Some(scope)。
+fn ask_install_scope() -> Option<InstallScope> {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::Controls::{
+        TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOG_BUTTON, TDCBF_CANCEL_BUTTON,
+        TDF_ALLOW_DIALOG_CANCELLATION,
+    };
+    const ID_INSTALL: i32 = 1000;
+    const ID_PERUSER: i32 = 201;
+    const ID_MACHINE: i32 = 202;
+    let title = wide_nul("LustTermina のインストール");
+    let main = wide_nul("LustTermina をインストールしますか？");
+    let content = wide_nul(
+        "スタートメニューのショートカットと、フォルダ右クリックの「LustTermina で開く」を追加します。",
+    );
+    let r1 = wide_nul("このユーザー専用でインストール（管理者権限は不要）");
+    let r2 = wide_nul("PC 全体にインストール（管理者権限が必要）");
+    let btn = wide_nul("インストール");
+    let radios = [
+        TASKDIALOG_BUTTON { nButtonID: ID_PERUSER, pszButtonText: PCWSTR(r1.as_ptr()) },
+        TASKDIALOG_BUTTON { nButtonID: ID_MACHINE, pszButtonText: PCWSTR(r2.as_ptr()) },
+    ];
+    let buttons = [TASKDIALOG_BUTTON { nButtonID: ID_INSTALL, pszButtonText: PCWSTR(btn.as_ptr()) }];
+    let mut cfg: TASKDIALOGCONFIG = unsafe { std::mem::zeroed() };
+    cfg.cbSize = std::mem::size_of::<TASKDIALOGCONFIG>() as u32;
+    cfg.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION;
+    cfg.dwCommonButtons = TDCBF_CANCEL_BUTTON;
+    cfg.pszWindowTitle = PCWSTR(title.as_ptr());
+    cfg.pszMainInstruction = PCWSTR(main.as_ptr());
+    cfg.pszContent = PCWSTR(content.as_ptr());
+    cfg.cButtons = buttons.len() as u32;
+    cfg.pButtons = buttons.as_ptr();
+    cfg.nDefaultButton = ID_INSTALL;
+    cfg.cRadioButtons = radios.len() as u32;
+    cfg.pRadioButtons = radios.as_ptr();
+    cfg.nDefaultRadioButton = ID_PERUSER; // 既定は自分専用（UAC 不要側）
+    let mut pressed = 0i32;
+    let mut radio = 0i32;
+    let ok =
+        unsafe { TaskDialogIndirect(&cfg, Some(&mut pressed), Some(&mut radio), None).is_ok() };
+    if !ok || pressed != ID_INSTALL {
+        return None; // キャンセル
+    }
+    Some(if radio == ID_MACHINE {
+        InstallScope::Machine
+    } else {
+        InstallScope::PerUser
+    })
 }
 
 // 本体終了後にインストールフォルダをまるごと削除する（自己削除）。窓は出さない。
@@ -3891,12 +4060,14 @@ fn schedule_dir_deletion(dir: &str) {
 // 起動時の意図（コマンドライン引数から決まる）。Explorer 連携の入口はここに集約し、
 // 将来 --run <script> やインストール系（--install など）もこの enum に足していく。
 enum Launch {
-    Normal,               // 通常起動：起動タブ定義に従う（未インストールなら導入を促す）
-    Cwd(String),          // --cwd <path>：そのフォルダでタブ1枚（起動タブ定義は無視）
-    Install,              // --install：この PC にインストールして終了
-    Uninstall,            // --uninstall：アンインストールして終了
-    InstallContextMenu,   // --install-context-menu：右クリックのみ登録して終了
-    UninstallContextMenu, // --uninstall-context-menu：右クリックのみ解除して終了
+    Normal,                    // 通常起動：起動タブ定義に従う（未インストールなら導入を促す）
+    Cwd(String),               // --cwd <path>：そのフォルダでタブ1枚（起動タブ定義は無視）
+    Install,                   // --install：インストール（先を選ばせて）実行し終了
+    Uninstall,                 // --uninstall：アンインストールして終了
+    DoInstallMachine,          // --do-install-machine：PC全体へ配置（昇格済みの代行ワーカ）
+    DoUninstallMachine(bool),  // --do-uninstall-machine <0|1>：PC全体を削除（昇格済みの代行ワーカ）
+    InstallContextMenu,        // --install-context-menu：右クリックのみ登録して終了
+    UninstallContextMenu,      // --uninstall-context-menu：右クリックのみ解除して終了
 }
 
 // 引数列（プログラム名は除いたもの）を解釈して起動意図を返す。
@@ -3910,6 +4081,11 @@ fn parse_launch<I: Iterator<Item = String>>(mut args: I) -> Launch {
             }
             "--install" => return Launch::Install,
             "--uninstall" => return Launch::Uninstall,
+            "--do-install-machine" => return Launch::DoInstallMachine,
+            "--do-uninstall-machine" => {
+                let del = args.next().as_deref() == Some("1");
+                return Launch::DoUninstallMachine(del);
+            }
             "--install-context-menu" => return Launch::InstallContextMenu,
             "--uninstall-context-menu" => return Launch::UninstallContextMenu,
             _ => {}
@@ -3919,43 +4095,60 @@ fn parse_launch<I: Iterator<Item = String>>(mut args: I) -> Launch {
 }
 
 fn main() -> eframe::Result {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        IDYES, MB_ICONINFORMATION, MB_ICONQUESTION, MB_YESNO,
-    };
+    use windows::Win32::System::Registry::HKEY_CURRENT_USER;
+    use windows::Win32::UI::WindowsAndMessaging::MB_ICONINFORMATION;
     let launch = parse_launch(std::env::args().skip(1));
     // 窓を出さずに完結する起動（インストール系・右クリック登録/解除）は、ここで実行して終了。
     match &launch {
         Launch::Install => {
-            let ok = do_install();
+            // インストール先（このユーザー／PC全体）をラジオで選ばせて実行。
+            let Some(scope) = ask_install_scope() else {
+                return Ok(()); // キャンセル
+            };
+            let ok = perform_install(scope);
             msg_box(
                 if ok {
                     "LustTermina をインストールしました。"
                 } else {
-                    "インストールに失敗しました。"
+                    "インストールに失敗しました（または中止されました）。"
                 },
                 "LustTermina",
                 MB_ICONINFORMATION,
             );
             std::process::exit(if ok { 0 } else { 1 });
         }
+        // 昇格済みの代行ワーカ：PC全体へ配置。ダイアログは出さず終了コードで返す。
+        Launch::DoInstallMachine => {
+            std::process::exit(if do_install(InstallScope::Machine) { 0 } else { 1 });
+        }
         Launch::Uninstall => {
-            // 1枚の TaskDialog で確認＋データ削除の可否（チェックボックス, 既定オフ）を選ぶ。
+            // 入っている場所（このユーザー／PC全体）を判定し、1枚の TaskDialog で
+            // 確認＋データ削除の可否（チェックボックス, 既定オフ）を選ぶ。
+            let scope = current_install_scope();
             let Some(delete_data) = ask_uninstall() else {
                 return Ok(()); // キャンセル
             };
-            do_uninstall(delete_data);
+            perform_uninstall(scope, delete_data);
             // 削除は本体終了後に実行される。ここで静かに終了。
             return Ok(());
         }
+        // 昇格済みの代行ワーカ：PC全体を削除。
+        Launch::DoUninstallMachine(delete_data) => {
+            do_uninstall(InstallScope::Machine, *delete_data);
+            return Ok(());
+        }
         Launch::InstallContextMenu => {
-            std::process::exit(if install_context_menu(&current_exe_string()) {
-                0
-            } else {
-                1
-            });
+            // 単独の右クリック登録は このユーザー（HKCU）に対して行う。
+            std::process::exit(
+                if install_context_menu(HKEY_CURRENT_USER, &current_exe_string()) {
+                    0
+                } else {
+                    1
+                },
+            );
         }
         Launch::UninstallContextMenu => {
-            std::process::exit(if uninstall_context_menu() { 0 } else { 1 });
+            std::process::exit(if uninstall_context_menu(HKEY_CURRENT_USER) { 0 } else { 1 });
         }
         // Explorer の「このディレクトリで開く」等で2つ目以降が起動されたら、既存インスタンスへ
         // 転送して自分は窓を出さずに終了する。転送先が居なければ通常起動（自分が本体になる）。
@@ -3966,18 +4159,15 @@ fn main() -> eframe::Result {
         }
         Launch::Normal => {
             // インストール先以外から起動され、まだ未インストールなら導入を促す（初回のぽちぽち）。
-            if !running_from_install() && !is_installed() {
-                let r = msg_box(
-                    "LustTermina をこの PC にインストールしますか？\nスタートメニューのショートカットと、フォルダ右クリックの「LustTermina で開く」を追加します。",
-                    "LustTermina のインストール",
-                    MB_YESNO | MB_ICONQUESTION,
-                );
-                if r == IDYES && do_install() {
-                    // 以後は本体＝インストール版にしたいので、そちらを起動して自分は終了。
-                    if let Some(exe) = installed_exe() {
-                        let _ = std::process::Command::new(exe).spawn();
+            if !running_from_install() && installed_scope().is_none() {
+                if let Some(scope) = ask_install_scope() {
+                    if perform_install(scope) {
+                        // 以後は本体＝インストール版にしたいので、そちらを起動して自分は終了。
+                        if let Some(exe) = installed_exe(scope) {
+                            let _ = std::process::Command::new(exe).spawn();
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
                 }
             }
         }
