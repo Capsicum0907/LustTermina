@@ -5,6 +5,12 @@
 （`%USERPROFILE%\.cargo\registry\...`）がバイナリに残る。そのため公開用ビルドは必ずパスの
 remap を付けて作る。
 
+加えて、公開ビルドは **C ランタイムを静的リンク**する（`+crt-static`）。既定の MSVC ターゲットは
+`VCRUNTIME140.dll` 等を動的リンクするため、VC++ 再頒布可能パッケージ未導入のクリーンな Windows では
+起動時に「VCRUNTIME140.dll が見つからない」で**起動すらできない**（開発機には VS 等の副産物で常駐して
+いるため気づけない）。静的リンクで単一 exe として自己完結させる。`RUSTFLAGS` を立てると
+`.cargo/config.toml` の rustflags は無視されるので、remap と crt-static は同じ `RUSTFLAGS` に並べる。
+
 ## ビルド
 
 リポジトリ直下で：
@@ -13,14 +19,14 @@ remap を付けて作る。
 ./scripts/build-release.ps1
 ```
 
-このスクリプトは `RUSTFLAGS="--remap-path-prefix=$env:USERPROFILE=C:\Users\user"` を付けて
-`cargo build --release` し、生成した `target/release/lust_termina.exe` に実ユーザー名が残って
+このスクリプトは `RUSTFLAGS="--remap-path-prefix=$env:USERPROFILE=C:\Users\user -C target-feature=+crt-static"`
+を付けて `cargo build --release` し、生成した `target/release/lust_termina.exe` に実ユーザー名が残って
 いないか自己検査する（残っていれば失敗して停止＝取りこぼしを防ぐ）。
 
 手で同じことをするなら（PowerShell）：
 
 ```powershell
-$env:RUSTFLAGS = "--remap-path-prefix=$env:USERPROFILE=C:\Users\user"; cargo build --release
+$env:RUSTFLAGS = "--remap-path-prefix=$env:USERPROFILE=C:\Users\user -C target-feature=+crt-static"; cargo build --release
 Remove-Item Env:RUSTFLAGS
 ```
 
