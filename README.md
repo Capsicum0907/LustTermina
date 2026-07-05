@@ -23,9 +23,15 @@
 
 | | |
 |:--:|:--:|
-| <img src="assets/screenshots/tab-green.png" width="380" alt="緑に色分けしたタブ"> | <img src="assets/screenshots/tab-red.png" width="380" alt="赤に色分けしたタブ（WSL）"> |
+| <img src="assets/screenshots/tab-green.png" width="380" alt="緑に色分けしたタブ"> | <img src="assets/screenshots/tab-red.png" width="380" alt="赤に色分けしたタブ"> |
 
-**色の設定 ／ 対応シェル** — 色はパレットから選択（「起動タブに追加」で起動構成にも保存）。対応シェルは PowerShell 7・Windows PowerShell・コマンドプロンプト・VS Developer・Git Bash・WSL をアイコン付きで選べます。
+**タブパネルは左右どちらにも** — タブの列を好みの側に配置できます。
+
+| | |
+|:--:|:--:|
+| <img src="assets/screenshots/panel-left.png" width="380" alt="タブパネルを左に配置"> | <img src="assets/screenshots/panel-right.png" width="380" alt="タブパネルを右に配置"> |
+
+**色の設定 ／ 対応シェル** — 色はパレットから選択（「起動タブに追加」で起動構成にも保存）。対応シェルは PowerShell 7・Windows PowerShell・コマンドプロンプト・VS Developer・Git Bash・WSL をアイコン付きで選べます（一覧に出るのは実際に導入済みのシェルです）。
 
 | | |
 |:--:|:--:|
@@ -35,9 +41,17 @@
 
 <img src="assets/screenshots/startup-tabs.png" width="720" alt="起動タブの編集画面">
 
-**日本語の表示・入力にも対応**
+**日本語の表示・入力にも対応** — IME での日本語入力、日本語の表示どちらにも対応しています。
 
 <img src="assets/screenshots/japanese.png" width="600" alt="日本語の表示">
+
+**システム設定** — 現在のバージョン、設定データの管理（データフォルダを開く／初期化）、アンインストールをまとめています。
+
+<img src="assets/screenshots/system-tab.png" width="720" alt="システムタブ（バージョン・データ・アンインストール）">
+
+**インストーラ（更新対応）** — 配布 exe を起動すると導入先（このユーザー専用／PC 全体）を選べます。導入済みなら現在の版を検出して「更新／再インストール」を出し分けます。
+
+<img src="assets/screenshots/installer.png" width="520" alt="更新対応インストーラのダイアログ">
 
 ## 動作環境
 
