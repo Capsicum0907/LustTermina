@@ -60,6 +60,8 @@ const TAB_HOVER_BG: Color32 = Color32::from_gray(42);
 const TAB_TEXT: Color32 = Color32::from_gray(225); // 非アクティブ＝白っぽく
 const TAB_TEXT_ACTIVE: Color32 = Color32::from_gray(245);
 const ACCENT_GREEN: Color32 = Color32::from_rgb(0x19, 0xC3, 0x7D); // アクセント（アイコンと同じ緑）
+// 注意喚起（プリセット名の重複/空など、参照できない状態）用の橙。エラーではなく警告の色。
+const WARN_COLOR: Color32 = Color32::from_rgb(0xE0, 0x8A, 0x3A);
 // 破壊的アクション（データ初期化・アンインストール）用の赤。緑=選択専用とは役割を分ける。
 const DANGER_FILL: Color32 = Color32::from_rgb(0x5A, 0x28, 0x28);
 const DANGER_BORDER: Color32 = Color32::from_rgb(0x8A, 0x40, 0x40);
@@ -718,6 +720,9 @@ impl EventListener for EventProxy {
 // （通信待ちで一時的に出力が止まるコマンドの取りこぼしは、quiet を上げて詰める）。
 const STARTUP_QUIET_MS: u64 = 800;
 const STARTUP_MAX_WAIT_MS: u64 = 8000;
+// 起動リストの「プリセット参照」が presets に見つからないとき、タブ名の頭に付ける印。
+// 黙って既定シェルにフォールバックせず、未解決だと気付ける形にする（silent fail 回避）。
+const UNRESOLVED_PRESET_MARK: &str = "⚠";
 fn default_startup_quiet_ms() -> u64 {
     STARTUP_QUIET_MS
 }
@@ -1430,10 +1435,11 @@ struct TabDrag {
 // ---- 設定の永続化（TOML。%APPDATA%\LustTermina\config.toml）----
 // 既定シェルは index ではなく short 名で保存（探索結果は環境で変わるため index は脆い）。
 // 色は "#RRGGBB" 文字列で保存（手編集しやすく、toml にも素直）。
-// 起動時に開くタブ1枚ぶんの定義。空文字の項目は既定にフォールバックする。
-// 空文字＝省略は toml 上も出力しない（skip_serializing_if）ので従来の Option 版と互換。
+// タブ1枚ぶんのインライン定義（名前・シェル・cwd・色・起動コマンド）。空文字の項目は
+// 既定にフォールバックする。空文字＝省略は toml 上も出力しない（skip_serializing_if）。
+// 用途は2つ：(1) プリセット（型）の中身、(2) 起動リストの「マニュアル」エントリの中身。
 #[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
-struct StartupTab {
+struct TabSpec {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -1452,6 +1458,150 @@ struct StartupTab {
     commands_buf: String,
 }
 
+impl TabSpec {
+    // GUI 編集バッファ（複数行テキスト）を commands から初期化する。load 後に呼ぶ。
+    fn sync_buf_from_commands(&mut self) {
+        self.commands_buf = self.commands.join("\n");
+    }
+    // 保存前：GUI バッファ → commands（各行 trim、空行除去）へ確定する。
+    fn commands_from_buf(&self) -> Vec<String> {
+        self.commands_buf
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect()
+    }
+}
+
+// skip_serializing_if 用（false は TOML に出力しない）。
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+// 起動リストの1エントリ。参照モード（use_preset）なら presets から preset 名で解決、
+// そうでなければマニュアル（spec をそのまま使う）。行は3状態を取る：マニュアル／参照・選択済／
+// 参照・未選択。preset 名だけでは未選択と区別できないため use_preset で明示する。
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+struct StartupEntry {
+    // 参照モードか。これがモードの唯一の真＝false なら preset 値があってもマニュアル（preset 無視）。
+    // 旧形式（このキー無し）は false＝マニュアルとして読める＝後方互換。
+    #[serde(default, skip_serializing_if = "is_false")]
+    use_preset: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    preset: String, // 参照するプリセット名（未選択なら空）。use_preset=false のときは無視。
+    #[serde(flatten)]
+    spec: TabSpec, // マニュアル時の定義（参照時は未使用＝空のまま出力されない）
+}
+
+impl StartupEntry {
+    // モードは use_preset のみで決まる。preset 値だけで参照扱いにはしない（手編集の齟齬回避）。
+    fn is_preset(&self) -> bool {
+        self.use_preset
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    // flatten + toml の直列化が壊れていないことを round-trip で担保する。
+    // プリセット参照エントリ／マニュアルエントリの双方が正しく往復すること。
+    #[test]
+    fn settings_roundtrip() {
+        let s = Settings {
+            default_shell: "pwsh".into(),
+            presets: vec![TabSpec {
+                name: "Atrium".into(),
+                shell: "pwsh".into(),
+                cwd: "C:\\work".into(),
+                accent: "#33CC77".into(),
+                commands: vec!["claude".into()],
+                ..Default::default()
+            }],
+            startup: vec![
+                StartupEntry { use_preset: true, preset: "Atrium".into(), ..Default::default() },
+                StartupEntry {
+                    spec: TabSpec {
+                        name: "作業".into(),
+                        shell: "cmd".into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ],
+            startup_quiet_ms: default_startup_quiet_ms(),
+            startup_max_wait_ms: default_startup_max_wait_ms(),
+            ..Default::default()
+        };
+        let text = toml::to_string_pretty(&s).expect("serialize");
+        let back: Settings = toml::from_str(&text).expect("deserialize");
+        assert_eq!(back.presets.len(), 1);
+        assert_eq!(back.presets[0].name, "Atrium");
+        assert_eq!(back.presets[0].commands, vec!["claude".to_string()]);
+        assert_eq!(back.startup.len(), 2);
+        assert!(back.startup[0].is_preset());
+        assert_eq!(back.startup[0].preset, "Atrium");
+        assert!(!back.startup[1].is_preset());
+        assert_eq!(back.startup[1].spec.name, "作業");
+        assert_eq!(back.startup[1].spec.shell, "cmd");
+    }
+
+    // 参照モードだが未選択（use_preset=true, preset 空）が、マニュアルと区別されて往復すること。
+    #[test]
+    fn preset_mode_unselected_roundtrip() {
+        let s = Settings {
+            startup: vec![StartupEntry { use_preset: true, ..Default::default() }],
+            startup_quiet_ms: default_startup_quiet_ms(),
+            startup_max_wait_ms: default_startup_max_wait_ms(),
+            ..Default::default()
+        };
+        let text = toml::to_string_pretty(&s).expect("serialize");
+        assert!(text.contains("use_preset = true"), "mode flag must persist: {text}");
+        let back: Settings = toml::from_str(&text).expect("deserialize");
+        assert!(back.startup[0].is_preset(), "unselected preset is still preset mode");
+        assert!(back.startup[0].preset.is_empty());
+    }
+
+    // 手編集で use_preset 無し（=false）かつ preset 値ありは、マニュアル扱い＝preset を無視する。
+    #[test]
+    fn preset_value_ignored_without_flag() {
+        let src = r##"
+[[startup_tabs]]
+preset = "Atrium"
+name = "手動"
+shell = "cmd"
+"##;
+        let s: Settings = toml::from_str(src).expect("parse");
+        assert_eq!(s.startup.len(), 1);
+        assert!(!s.startup[0].is_preset(), "use_preset 無し＝マニュアル");
+        assert_eq!(s.startup[0].spec.name, "手動");
+    }
+
+    // 0.2.x 形式（インライン定義のみの [[startup_tabs]]）が、移行なしで
+    // マニュアルエントリとして読めること＝上位互換を担保する。
+    #[test]
+    fn loads_legacy_startup_tabs() {
+        let legacy = r##"
+default_shell = "pwsh"
+
+[[startup_tabs]]
+name = "Atrium"
+shell = "pwsh"
+cwd = "C:\\Atrium"
+accent = "#33CC77"
+commands = ["claude --remote-control"]
+"##;
+        let s: Settings = toml::from_str(legacy).expect("legacy parse");
+        assert_eq!(s.startup.len(), 1);
+        assert!(!s.startup[0].is_preset());
+        assert_eq!(s.startup[0].spec.name, "Atrium");
+        assert_eq!(s.startup[0].spec.shell, "pwsh");
+        assert_eq!(s.startup[0].spec.commands, vec!["claude --remote-control".to_string()]);
+        assert!(s.presets.is_empty());
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct Settings {
     #[serde(default)]
@@ -1464,8 +1614,18 @@ struct Settings {
     default_accent: String,
     #[serde(default)]
     panel: String, // "left" | "right"（タブパネルの位置。空=left）
+    // 型ライブラリ：再利用できるタブ定義（プリセット）。name が識別子を兼ねる。
     #[serde(default)]
-    startup_tabs: Vec<StartupTab>,
+    presets: Vec<TabSpec>,
+    // 起動時に開くタブのリスト。各行はプリセット参照 or マニュアル（StartupEntry 参照）。
+    // TOML キーは 0.2.x から不変の `startup_tabs`。旧形式（インライン定義のみ）は
+    // flatten のおかげでマニュアルエントリとしてそのまま読める＝完全な上位互換で移行不要。
+    #[serde(default, rename = "startup_tabs")]
+    startup: Vec<StartupEntry>,
+    // 「LustTermina で実行」で使うシェルを拡張子ごとに選ぶ（拡張子 → シェル short 名）。
+    // 未設定の拡張子は組込み既定（default_runner_short）。TOML では [script_runner] テーブル。
+    #[serde(default)]
+    script_runner: std::collections::BTreeMap<String, String>,
     // 起動コマンドの投入ペース（ミリ秒）。未指定は既定値。通信待ちで出力が一時停止する
     // コマンド（例: /remote-control）を取りこぼすときは startup_quiet_ms を上げる。
     #[serde(default = "default_startup_quiet_ms")]
@@ -1510,6 +1670,7 @@ fn color_from_hex(s: &str) -> Option<Color32> {
 enum SettingsTab {
     General, // 既定（パネル位置・既定シェル・初期ディレクトリ）
     Theme,   // テーマ（既定の背景・アクセント）
+    Presets, // プリセット（型ライブラリの編集）
     Startup, // 起動タブ
     System,  // システム（データフォルダ・初期化・アンインストール）
 }
@@ -1536,10 +1697,16 @@ struct App {
     panel_right: bool,       // タブパネルを右に置くか（false=左）
     startup_quiet_ms: u64,   // 起動コマンド投入の静穏窓（config 可変、既定 STARTUP_QUIET_MS）
     startup_max_wait_ms: u64, // 同・待ち上限（config 可変、既定 STARTUP_MAX_WAIT_MS）
-    startup_tabs: Vec<StartupTab>, // 起動時に開くタブ定義（空＝既定シェル1枚）
+    presets: Vec<TabSpec>,     // 型ライブラリ（再利用できるタブ定義。name が識別子）
+    startup: Vec<StartupEntry>, // 起動時に開くタブ定義（空＝既定シェル1枚）
+    script_runner: std::collections::BTreeMap<String, String>, // 拡張子→スクリプト実行シェル short
+    script_dd_open: Option<usize>, // 既定タブ：スクリプト実行シェルのDDを開いている拡張子行
     startup_shell_open: Option<usize>, // 起動タブ編集：シェルDDを開いているカード
     startup_color_open: Option<(usize, bool)>, // 色パレットを開いているカード（bool=accent）
-    card_drag: Option<TabDrag>,        // 起動タブカードの D&D 並べ替え状態
+    preset_shell_open: Option<usize>,  // プリセット編集：シェルDDを開いているカード
+    preset_color_open: Option<(usize, bool)>, // 同・色パレットを開いているカード（bool=accent）
+    startup_pick_open: Option<usize>,  // 起動タブ（参照モード）：プリセット選択DDを開いているカード
+    card_drag: Option<TabDrag>,        // カード（起動タブ／プリセット）の D&D 並べ替え状態
     toast: Option<(String, std::time::Instant)>, // 一時通知（保存しました 等）
     // 別インスタンスから転送された「このフォルダで開く」要求の受信口（本体のみ Some）。
     ipc_rx: Option<mpsc::Receiver<IpcMsg>>,
@@ -1583,7 +1750,9 @@ impl App {
         let mut panel_right = false;
         let mut startup_quiet_ms = STARTUP_QUIET_MS;
         let mut startup_max_wait_ms = STARTUP_MAX_WAIT_MS;
-        let mut startup_tabs: Vec<StartupTab> = Vec::new();
+        let mut presets: Vec<TabSpec> = Vec::new();
+        let mut startup: Vec<StartupEntry> = Vec::new();
+        let mut script_runner: std::collections::BTreeMap<String, String> = Default::default();
         if let Some(cfg) = load_settings() {
             panel_right = cfg.panel == "right";
             startup_quiet_ms = cfg.startup_quiet_ms;
@@ -1600,11 +1769,16 @@ impl App {
             if let Some(c) = color_from_hex(&cfg.default_accent) {
                 default_accent = c;
             }
-            startup_tabs = cfg.startup_tabs;
+            presets = cfg.presets;
+            startup = cfg.startup;
+            script_runner = cfg.script_runner;
         }
-        // GUI 編集用の複数行バッファを commands から初期化。
-        for st in &mut startup_tabs {
-            st.commands_buf = st.commands.join("\n");
+        // GUI 編集用の複数行バッファを commands から初期化（プリセット・マニュアル双方）。
+        for p in &mut presets {
+            p.sync_buf_from_commands();
+        }
+        for e in &mut startup {
+            e.spec.sync_buf_from_commands();
         }
 
         // 起動タブ：定義があれば順に開く。各項目は未指定なら既定にフォールバック。
@@ -1630,10 +1804,11 @@ impl App {
                 path,
                 &shells,
                 default_shell,
+                &script_runner,
                 default_bg,
                 default_accent,
             ));
-        } else if startup_tabs.is_empty() {
+        } else if startup.is_empty() {
             let mut s = Session::spawn(
                 &cc.egui_ctx,
                 format!("{} 1", shells[default_shell].short),
@@ -1644,28 +1819,50 @@ impl App {
             s.accent = default_accent;
             sessions.push(s);
         } else {
-            for (n, st) in startup_tabs.iter().enumerate() {
+            for (n, entry) in startup.iter().enumerate() {
+                // エントリをタブ定義へ解決する。プリセット参照は presets から name で引く。
+                // 解決できない参照は既定シェルで開き、タブ名に未解決マーカーを付けて可視化する
+                // （黙って落とさない＝silent fail 回避）。マニュアルは spec をそのまま使う。
+                let (spec, unresolved) = if entry.is_preset() {
+                    match presets.iter().find(|p| p.name == entry.preset) {
+                        Some(p) => (p.clone(), false),
+                        None => {
+                            // 未選択（preset 名が空）と、名前は入っているが見つからない場合を区別。
+                            let label = if entry.preset.is_empty() {
+                                format!("{} (未選択)", UNRESOLVED_PRESET_MARK)
+                            } else {
+                                format!("{} {}", UNRESOLVED_PRESET_MARK, entry.preset)
+                            };
+                            (TabSpec { name: label, ..Default::default() }, true)
+                        }
+                    }
+                } else {
+                    (entry.spec.clone(), false)
+                };
                 let si = shells
                     .iter()
-                    .position(|s| s.short == st.shell)
+                    .position(|s| s.short == spec.shell)
                     .unwrap_or(default_shell);
-                let cwd = if st.cwd.is_empty() {
+                let cwd = if spec.cwd.is_empty() {
                     default_cwd.clone()
                 } else {
-                    st.cwd.clone()
+                    spec.cwd.clone()
                 };
-                let name = if st.name.is_empty() {
+                let name = if spec.name.is_empty() {
                     format!("{} {}", shells[si].short, n + 1)
                 } else {
-                    st.name.clone()
+                    spec.name.clone()
                 };
-                let bg = color_from_hex(&st.bg).unwrap_or(default_bg);
-                let accent = color_from_hex(&st.accent).unwrap_or(default_accent);
+                let bg = color_from_hex(&spec.bg).unwrap_or(default_bg);
+                let accent = color_from_hex(&spec.accent).unwrap_or(default_accent);
                 let mut s = Session::spawn(&cc.egui_ctx, name, &shells[si], &cwd);
                 s.bg = bg;
                 s.accent = accent;
                 // 出力が静まってから次を送る（claude 等の TUI にも投入できるように）。
-                s.send_commands_paced(st.commands.clone(), startup_quiet_ms, startup_max_wait_ms);
+                // 未解決参照はコマンドを持たないので送らない。
+                if !unresolved {
+                    s.send_commands_paced(spec.commands.clone(), startup_quiet_ms, startup_max_wait_ms);
+                }
                 sessions.push(s);
             }
         }
@@ -1691,9 +1888,15 @@ impl App {
             panel_right,
             startup_quiet_ms,
             startup_max_wait_ms,
-            startup_tabs,
+            presets,
+            startup,
+            script_runner,
+            script_dd_open: None,
             startup_shell_open: None,
             startup_color_open: None,
+            preset_shell_open: None,
+            preset_color_open: None,
+            startup_pick_open: None,
             card_drag: None,
             toast: None,
             // 受け口の生成に成功した（＝このプロセスが本体の）ときだけ Some。
@@ -1725,6 +1928,7 @@ impl App {
             path,
             &self.shells,
             self.default_shell,
+            &self.script_runner,
             self.default_bg,
             self.default_accent,
         );
@@ -1753,22 +1957,34 @@ impl App {
             panel: if self.panel_right { "right".into() } else { "left".into() },
             startup_quiet_ms: self.startup_quiet_ms,
             startup_max_wait_ms: self.startup_max_wait_ms,
-            // 保存時に commands_buf（複数行テキスト）→ commands（行配列、空行除去）へ。
-            startup_tabs: self
-                .startup_tabs
+            // 保存時に commands_buf（複数行テキスト）→ commands（行配列、空行除去）へ確定。
+            presets: self
+                .presets
                 .iter()
-                .map(|st| {
-                    let mut s = st.clone();
-                    s.commands = st
-                        .commands_buf
-                        .lines()
-                        .map(str::trim)
-                        .filter(|l| !l.is_empty())
-                        .map(String::from)
-                        .collect();
+                .map(|p| {
+                    let mut s = p.clone();
+                    s.commands = p.commands_from_buf();
                     s
                 })
                 .collect(),
+            // マニュアルエントリのみ commands を確定（プリセット参照は spec を持たない）。
+            startup: self
+                .startup
+                .iter()
+                .map(|e| {
+                    let mut e = e.clone();
+                    if e.is_preset() {
+                        // 参照モードは spec を持たない＝TOML に残さずクリーンに保つ。
+                        e.spec = TabSpec::default();
+                    } else {
+                        // マニュアルは preset 値を残さない（use_preset=false で無視される値の齟齬回避）。
+                        e.preset.clear();
+                        e.spec.commands = e.spec.commands_from_buf();
+                    }
+                    e
+                })
+                .collect(),
+            script_runner: self.script_runner.clone(),
         };
         if let Ok(text) = toml::to_string_pretty(&s) {
             if let Some(dir) = path.parent() {
@@ -1792,12 +2008,49 @@ impl App {
         self.panel_right = false;
         self.startup_quiet_ms = STARTUP_QUIET_MS;
         self.startup_max_wait_ms = STARTUP_MAX_WAIT_MS;
-        self.startup_tabs.clear();
+        self.presets.clear();
+        self.startup.clear();
+        self.script_runner.clear();
     }
 
-    // 現在開いているタブ群を起動タブ定義に変換（スナップショット）。
-    fn snapshot_startup_tabs(&self) -> Vec<StartupTab> {
-        self.sessions.iter().map(startup_tab_of).collect()
+    // 現在開いているタブ群を起動リスト（すべてマニュアル）に変換（スナップショット）。
+    fn snapshot_startup(&self) -> Vec<StartupEntry> {
+        self.sessions
+            .iter()
+            .map(|s| StartupEntry { spec: tab_spec_of(s), ..Default::default() })
+            .collect()
+    }
+
+    // プリセット（型）から新しいタブを実体化して開く。起動時と同じ解決規則で、
+    // 未指定フィールドは既定にフォールバック。コマンドは編集中バッファを正とする。
+    fn spawn_tab_from_spec(&mut self, ctx: &egui::Context, spec: &TabSpec) {
+        let si = self
+            .shells
+            .iter()
+            .position(|s| s.short == spec.shell)
+            .unwrap_or(self.default_shell);
+        let cwd = if spec.cwd.is_empty() {
+            self.default_cwd.clone()
+        } else {
+            spec.cwd.clone()
+        };
+        let id = self.next_id;
+        self.next_id += 1;
+        let name = if spec.name.is_empty() {
+            format!("{} {}", self.shells[si].short, id)
+        } else {
+            spec.name.clone()
+        };
+        let mut sess = Session::spawn(ctx, name, &self.shells[si], &cwd);
+        sess.bg = color_from_hex(&spec.bg).unwrap_or(self.default_bg);
+        sess.accent = color_from_hex(&spec.accent).unwrap_or(self.default_accent);
+        sess.send_commands_paced(
+            spec.commands_from_buf(),
+            self.startup_quiet_ms,
+            self.startup_max_wait_ms,
+        );
+        self.sessions.push(sess);
+        self.active = self.sessions.len() - 1;
     }
 
     // 設定ページ（端末の代わりに中央へ全面表示）。閉じる時に TOML 保存。
@@ -1876,6 +2129,8 @@ impl App {
                     ui.add_space(2.0);
                     settings_nav_item(ui, &mut self.settings_tab, SettingsTab::Theme, "UI/テーマ", false);
                     ui.add_space(2.0);
+                    settings_nav_item(ui, &mut self.settings_tab, SettingsTab::Presets, "プリセット", false);
+                    ui.add_space(2.0);
                     settings_nav_item(ui, &mut self.settings_tab, SettingsTab::Startup, "起動タブ", false);
                     ui.add_space(2.0);
                     settings_nav_item(ui, &mut self.settings_tab, SettingsTab::System, "システム", false);
@@ -1944,6 +2199,103 @@ impl App {
                             .desired_width(300.0)
                             .hint_text("空＝親プロセスを継承"),
                     );
+                    ui.add_space(14.0);
+
+                    // スクリプト実行に使うシェルを拡張子ごとに選ぶ（右クリック「LustTermina で実行」）。
+                    // 拡張子リストは SCRIPT_EXTS が唯一の正＝将来 .sh を足せば自動でこの欄も増える。
+                    ui.label(egui::RichText::new("スクリプト実行に使うシェル").color(TAB_TEXT));
+                    ui.label(
+                        egui::RichText::new(
+                            "右クリック「LustTermina で実行」で使うシェルを拡張子ごとに選べます（未設定は既定）。",
+                        )
+                        .color(Color32::from_gray(130))
+                        .size(11.0),
+                    );
+                    ui.add_space(4.0);
+                    for (idx, ext) in SCRIPT_EXTS.iter().enumerate() {
+                        let key = ext.trim_start_matches('.');
+                        // 実効シェル：config 選択 → 組込み既定。未設定なら「（既定）」を付す。
+                        let cur_short = self
+                            .script_runner
+                            .get(key)
+                            .cloned()
+                            .unwrap_or_else(|| default_runner_short(key).to_string());
+                        let cur_idx = self.shells.iter().position(|s| s.short == cur_short);
+                        let cur_label = cur_idx
+                            .map(|k| self.shells[k].label.clone())
+                            .unwrap_or_else(|| cur_short.clone());
+                        let is_default = !self.script_runner.contains_key(key);
+                        let open = self.script_dd_open == Some(idx);
+                        let arrow = if open { "▲" } else { "▼" };
+                        ui.horizontal(|ui| {
+                            ui.add_sized(
+                                [46.0, 26.0],
+                                egui::Label::new(egui::RichText::new(*ext).color(TAB_TEXT)),
+                            );
+                            let suffix = if is_default { "（既定）" } else { "" };
+                            let htext = format!("{cur_label}{suffix}　{arrow}");
+                            let header = match cur_idx
+                                .and_then(|k| self.shell_icons.get(k))
+                                .and_then(|o| o.as_ref())
+                            {
+                                Some(tex) => {
+                                    let img =
+                                        egui::Image::new(tex).fit_to_exact_size(Vec2::splat(16.0));
+                                    ui.add_sized(
+                                        [254.0, 26.0],
+                                        egui::Button::image_and_text(img, htext),
+                                    )
+                                }
+                                None => ui.add_sized([254.0, 26.0], egui::Button::new(htext)),
+                            };
+                            let hrect = header.rect;
+                            if header.clicked() {
+                                self.script_dd_open = if open { None } else { Some(idx) };
+                            }
+                            if open {
+                                let dd_frame = egui::Frame::new()
+                                    .fill(Color32::from_gray(40))
+                                    .stroke(egui::Stroke::new(1.0, Color32::from_gray(70)))
+                                    .corner_radius(6.0)
+                                    .inner_margin(egui::Margin::same(4));
+                                let mut picked: Option<usize> = None;
+                                let area = egui::Area::new(egui::Id::new(("script_dd", idx)))
+                                    .order(egui::Order::Tooltip)
+                                    .fixed_pos(hrect.left_bottom() + Vec2::new(0.0, 2.0))
+                                    .show(ctx, |ui| {
+                                        dd_frame.show(ui, |ui| {
+                                            ui.set_min_width(hrect.width() - 8.0);
+                                            egui::ScrollArea::vertical().max_height(220.0).show(
+                                                ui,
+                                                |ui| {
+                                                    if let Some(k) = shell_list(
+                                                        ui,
+                                                        &self.shells,
+                                                        &self.shell_icons,
+                                                        cur_idx,
+                                                    ) {
+                                                        picked = Some(k);
+                                                    }
+                                                },
+                                            );
+                                        });
+                                    });
+                                let arect = area.response.rect;
+                                if let Some(k) = picked {
+                                    self.script_runner
+                                        .insert(key.to_string(), self.shells[k].short.clone());
+                                    self.script_dd_open = None;
+                                } else if ctx.input(|i| i.pointer.any_pressed()) {
+                                    if let Some(p) = ctx.input(|i| i.pointer.interact_pos()) {
+                                        if !hrect.contains(p) && !arect.contains(p) {
+                                            self.script_dd_open = None;
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                        ui.add_space(2.0);
+                    }
                 }
 
                 // ===== UI/テーマタブ =====
@@ -1988,14 +2340,149 @@ impl App {
                     }
                 }
 
+                // ===== プリセットタブ =====
+                if self.settings_tab == SettingsTab::Presets {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("プリセット").color(TAB_TEXT));
+                        let status = if self.presets.is_empty() {
+                            "未登録＝起動タブ／新規タブで選べる型がありません".to_string()
+                        } else {
+                            format!("{} 個", self.presets.len())
+                        };
+                        ui.label(
+                            egui::RichText::new(status).color(Color32::from_gray(150)).size(12.0),
+                        );
+                    });
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "再利用できるタブ定義（型）。名前は一意に。起動タブや新規タブから選んで実体化します。",
+                        )
+                        .color(Color32::from_gray(130))
+                        .size(11.0),
+                    );
+                    ui.add_space(6.0);
+                    if primary_button(ui, "＋ 追加") {
+                        let name = unique_preset_name("プリセット", &self.presets);
+                        self.presets.push(TabSpec { name, ..Default::default() });
+                    }
+                    ui.add_space(8.0);
+
+                    // 名前の重複／空を検出して警告（参照できない型を可視化＝silent fail 回避）。
+                    let mut seen = std::collections::HashSet::new();
+                    let mut bad: Vec<String> = Vec::new();
+                    let mut has_empty = false;
+                    for p in &self.presets {
+                        if p.name.trim().is_empty() {
+                            has_empty = true;
+                        } else if !seen.insert(p.name.as_str()) && !bad.contains(&p.name) {
+                            bad.push(p.name.clone());
+                        }
+                    }
+                    if has_empty {
+                        bad.insert(0, "(空の名前)".to_string());
+                    }
+                    if !bad.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "⚠ 参照できない名前（重複/空）: {}",
+                                bad.join(" , ")
+                            ))
+                            .color(WARN_COLOR)
+                            .size(12.0),
+                        );
+                        ui.add_space(6.0);
+                    }
+
+                    let mut to_remove: Option<usize> = None;
+                    let mut to_move: Option<(usize, isize)> = None;
+                    let mut to_dup: Option<usize> = None;
+                    let pointer = ctx.input(|i| i.pointer.interact_pos());
+                    let mut card_rects: Vec<egui::Rect> = Vec::new();
+                    let avail_h = ui.available_height();
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .max_height(avail_h)
+                        .scroll_bar_visibility(
+                            egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                        )
+                        .show(ui, |ui| {
+                            let n = self.presets.len();
+                            for i in 0..n {
+                                let (act, rect) = tab_spec_card(
+                                    ui,
+                                    ctx,
+                                    "preset",
+                                    i,
+                                    &mut self.presets[i],
+                                    &self.shells,
+                                    &self.shell_icons,
+                                    self.default_bg,
+                                    self.default_accent,
+                                    panel_right,
+                                    &mut self.preset_shell_open,
+                                    &mut self.preset_color_open,
+                                    &mut self.card_drag,
+                                    pointer,
+                                    true,
+                                    None,
+                                );
+                                card_rects.push(rect);
+                                match act {
+                                    CardAction::Remove => to_remove = Some(i),
+                                    CardAction::Move(d) => to_move = Some((i, d)),
+                                    CardAction::Duplicate => to_dup = Some(i),
+                                    CardAction::None => {}
+                                }
+                            }
+                            let ghost =
+                                self.card_drag.and_then(|d| self.presets.get(d.from)).map(|p| {
+                                    let gbg = color_from_hex(&p.bg).unwrap_or(self.default_bg);
+                                    let gac =
+                                        color_from_hex(&p.accent).unwrap_or(self.default_accent);
+                                    (p.clone(), gbg, gac)
+                                });
+                            if let Some((from, target)) = card_dnd_resolve(
+                                ui,
+                                &mut self.card_drag,
+                                &card_rects,
+                                pointer,
+                                panel_right,
+                                ghost,
+                                &self.shells,
+                                &self.shell_icons,
+                            ) {
+                                move_card(&mut self.presets, from, target);
+                            }
+                        });
+                    // 複製：直後に挿入し、名前は一意化（型の識別子を衝突させない）。
+                    if let Some(i) = to_dup {
+                        if let Some(mut c) = self.presets.get(i).cloned() {
+                            c.name = unique_preset_name(&c.name, &self.presets);
+                            self.presets.insert(i + 1, c);
+                        }
+                    }
+                    if let Some(i) = to_remove
+                        && i < self.presets.len()
+                    {
+                        self.presets.remove(i);
+                    }
+                    if let Some((i, dir)) = to_move {
+                        let j = i as isize + dir;
+                        if j >= 0 && (j as usize) < self.presets.len() {
+                            self.presets.swap(i, j as usize);
+                        }
+                    }
+                }
+
                 // ===== 起動タブタブ =====
                 if self.settings_tab == SettingsTab::Startup {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("起動タブ").color(TAB_TEXT));
-                        let status = if self.startup_tabs.is_empty() {
+                        let status = if self.startup.is_empty() {
                             "未設定＝起動時は既定シェル1枚".to_string()
                         } else {
-                            format!("{} 枚", self.startup_tabs.len())
+                            format!("{} 枚", self.startup.len())
                         };
                         ui.label(
                             egui::RichText::new(status).color(Color32::from_gray(150)).size(12.0),
@@ -2004,14 +2491,15 @@ impl App {
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if primary_button(ui, "＋ 追加") {
-                            self.startup_tabs.push(StartupTab::default());
+                            // マニュアルエントリを1枚追加（プリセット参照の追加はスライスBで）。
+                            self.startup.push(StartupEntry::default());
                         }
                         if ghost_button(ui, "現在のタブ構成を抜き出す") {
-                            let snap = self.snapshot_startup_tabs();
-                            self.startup_tabs = snap;
+                            let snap = self.snapshot_startup();
+                            self.startup = snap;
                         }
                         if ghost_button(ui, "クリア") {
-                            self.startup_tabs.clear();
+                            self.startup.clear();
                         }
                     });
                     ui.add_space(8.0);
@@ -2028,462 +2516,74 @@ impl App {
                             egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
                         )
                         .show(ui, |ui| {
-                            let n = self.startup_tabs.len();
+                            let n = self.startup.len();
                             for i in 0..n {
-                                let dragging_this =
-                                    self.card_drag.map_or(false, |d| d.from == i);
-                                // カードの色＝実際のタブの見た目（bg＝塗り、accent＝枠）。
-                                // 空なら既定にフォールバック。bg スウォッチは明るい表示色で。
-                                let res_bg = color_from_hex(&self.startup_tabs[i].bg)
-                                    .unwrap_or(self.default_bg);
-                                let res_accent = color_from_hex(&self.startup_tabs[i].accent)
-                                    .unwrap_or(self.default_accent);
-                                let bg_disp = BG_APPLY
-                                    .iter()
-                                    .position(|c| *c == res_bg)
-                                    .map(|k| BG_DISPLAY[k])
-                                    .unwrap_or(res_bg);
-                                // 左端にドラッグハンドルぶんの余白（24px）を確保。
-                                let card_resp = egui::Frame::new()
-                                    .fill(if dragging_this {
-                                        res_bg.gamma_multiply(0.6)
-                                    } else {
-                                        res_bg
-                                    })
-                                    .stroke(egui::Stroke::new(1.0, Color32::from_gray(55)))
-                                    .corner_radius(6.0)
-                                    .inner_margin(if panel_right {
-                                        egui::Margin { left: 8, right: 30, top: 8, bottom: 8 }
-                                    } else {
-                                        egui::Margin { left: 30, right: 8, top: 8, bottom: 8 }
-                                    })
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.add_sized(
-                                                [150.0, 28.0],
-                                                egui::TextEdit::singleline(
-                                                    &mut self.startup_tabs[i].name,
-                                                )
-                                                .hint_text("名前")
-                                                .vertical_align(egui::Align::Center),
-                                            );
-                                            ui.add_space(6.0);
-                                            // シェル選択（既定タブと同じ前面ドロップダウン）
-                                            let sh = self.startup_tabs[i].shell.clone();
-                                            let sh_idx = if sh.is_empty() {
-                                                None
-                                            } else {
-                                                self.shells.iter().position(|s| s.short == sh)
-                                            };
-                                            // ヘッダは短縮名（アイコン併記で識別可）。長い
-                                            // 正式名はドロップダウン側で出す＝幅を溢れさせない。
-                                            let sh_label = match sh_idx {
-                                                Some(k) => self.shells[k].short.clone(),
-                                                None => "既定".to_string(),
-                                            };
-                                            let open = self.startup_shell_open == Some(i);
-                                            let arrow = if open { "▲" } else { "▼" };
-                                            let htext = format!("{sh_label}　{arrow}");
-                                            let header = match sh_idx
-                                                .and_then(|k| self.shell_icons.get(k))
-                                                .and_then(|o| o.as_ref())
-                                            {
-                                                Some(tex) => {
-                                                    let img = egui::Image::new(tex)
-                                                        .fit_to_exact_size(Vec2::splat(16.0));
-                                                    ui.add_sized(
-                                                        [170.0, 28.0],
-                                                        egui::Button::image_and_text(img, htext),
-                                                    )
-                                                }
-                                                None => ui.add_sized(
-                                                    [170.0, 28.0],
-                                                    egui::Button::new(htext),
-                                                ),
-                                            };
-                                            let hrect = header.rect;
-                                            if header.clicked() {
-                                                self.startup_shell_open =
-                                                    if open { None } else { Some(i) };
-                                            }
-                                            // 色スウォッチ（bg＝表示色／accent）。クリックでパレット。
-                                            ui.add_space(6.0);
-                                            let bg_resp = color_swatch(ui, bg_disp);
-                                            if bg_resp.clicked() {
-                                                self.startup_color_open =
-                                                    if self.startup_color_open == Some((i, false)) {
-                                                        None
-                                                    } else {
-                                                        Some((i, false))
-                                                    };
-                                            }
-                                            ui.add_space(4.0);
-                                            let ac_resp = color_swatch(ui, res_accent);
-                                            if ac_resp.clicked() {
-                                                self.startup_color_open =
-                                                    if self.startup_color_open == Some((i, true)) {
-                                                        None
-                                                    } else {
-                                                        Some((i, true))
-                                                    };
-                                            }
-                                            // 色パレットのポップアップ（bg / accent）
-                                            let pop_frame = egui::Frame::new()
-                                                .fill(Color32::from_gray(40))
-                                                .stroke(egui::Stroke::new(
-                                                    1.0,
-                                                    Color32::from_gray(70),
-                                                ))
-                                                .corner_radius(6.0)
-                                                .inner_margin(egui::Margin::same(6));
-                                            if self.startup_color_open == Some((i, false)) {
-                                                let mut pick: Option<Option<Color32>> = None;
-                                                let area = egui::Area::new(egui::Id::new((
-                                                    "startup_bg_pop",
-                                                    i,
-                                                )))
-                                                .order(egui::Order::Tooltip)
-                                                .fixed_pos(
-                                                    bg_resp.rect.left_bottom()
-                                                        + Vec2::new(0.0, 2.0),
-                                                )
-                                                .show(ctx, |ui| {
-                                                    pop_frame.show(ui, |ui| {
-                                                        ui.set_width(176.0);
-                                                        if ui
-                                                            .selectable_label(
-                                                                self.startup_tabs[i].bg.is_empty(),
-                                                                "既定",
-                                                            )
-                                                            .clicked()
-                                                        {
-                                                            pick = Some(None);
-                                                        }
-                                                        if let Some(c) = palette_picker(
-                                                            ui, &BG_DISPLAY, &BG_APPLY, res_bg,
-                                                        ) {
-                                                            pick = Some(Some(c));
-                                                        }
-                                                    });
-                                                });
-                                                let arect = area.response.rect;
-                                                if let Some(sel) = pick {
-                                                    self.startup_tabs[i].bg = match sel {
-                                                        Some(c) => color_to_hex(c),
-                                                        None => String::new(),
-                                                    };
-                                                    self.startup_color_open = None;
-                                                } else if ctx.input(|i| i.pointer.any_pressed()) {
-                                                    if let Some(p) =
-                                                        ctx.input(|i| i.pointer.interact_pos())
-                                                    {
-                                                        if !bg_resp.rect.contains(p)
-                                                            && !arect.contains(p)
-                                                        {
-                                                            self.startup_color_open = None;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            if self.startup_color_open == Some((i, true)) {
-                                                let mut pick: Option<Option<Color32>> = None;
-                                                let area = egui::Area::new(egui::Id::new((
-                                                    "startup_ac_pop",
-                                                    i,
-                                                )))
-                                                .order(egui::Order::Tooltip)
-                                                .fixed_pos(
-                                                    ac_resp.rect.left_bottom()
-                                                        + Vec2::new(0.0, 2.0),
-                                                )
-                                                .show(ctx, |ui| {
-                                                    pop_frame.show(ui, |ui| {
-                                                        ui.set_width(176.0);
-                                                        if ui
-                                                            .selectable_label(
-                                                                self.startup_tabs[i]
-                                                                    .accent
-                                                                    .is_empty(),
-                                                                "既定",
-                                                            )
-                                                            .clicked()
-                                                        {
-                                                            pick = Some(None);
-                                                        }
-                                                        if let Some(c) = palette_picker(
-                                                            ui,
-                                                            &ACCENT_PALETTE,
-                                                            &ACCENT_PALETTE,
-                                                            res_accent,
-                                                        ) {
-                                                            pick = Some(Some(c));
-                                                        }
-                                                    });
-                                                });
-                                                let arect = area.response.rect;
-                                                if let Some(sel) = pick {
-                                                    self.startup_tabs[i].accent = match sel {
-                                                        Some(c) => color_to_hex(c),
-                                                        None => String::new(),
-                                                    };
-                                                    self.startup_color_open = None;
-                                                } else if ctx.input(|i| i.pointer.any_pressed()) {
-                                                    if let Some(p) =
-                                                        ctx.input(|i| i.pointer.interact_pos())
-                                                    {
-                                                        if !ac_resp.rect.contains(p)
-                                                            && !arect.contains(p)
-                                                        {
-                                                            self.startup_color_open = None;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    // ゴミ箱＝削除、太い上下矢印＝並べ替え
-                                                    if settings_icon_btn(ui, "\u{e872}", true) {
-                                                        to_remove = Some(i);
-                                                    }
-                                                    ui.add_space(2.0);
-                                                    if settings_icon_btn(ui, "\u{e5db}", false) {
-                                                        to_move = Some((i, 1));
-                                                    }
-                                                    ui.add_space(2.0);
-                                                    if settings_icon_btn(ui, "\u{e5d8}", false) {
-                                                        to_move = Some((i, -1));
-                                                    }
-                                                },
-                                            );
-
-                                            // 前面ドロップダウン（このカードが開いている時）
-                                            if self.startup_shell_open == Some(i) {
-                                                let dd_frame = egui::Frame::new()
-                                                    .fill(Color32::from_gray(40))
-                                                    .stroke(egui::Stroke::new(
-                                                        1.0,
-                                                        Color32::from_gray(70),
-                                                    ))
-                                                    .corner_radius(6.0)
-                                                    .inner_margin(egui::Margin::same(4));
-                                                let mut picked: Option<String> = None;
-                                                let area = egui::Area::new(egui::Id::new((
-                                                    "startup_shell_dd",
-                                                    i,
-                                                )))
-                                                .order(egui::Order::Tooltip)
-                                                .fixed_pos(
-                                                    hrect.left_bottom() + Vec2::new(0.0, 2.0),
-                                                )
-                                                .show(ctx, |ui| {
-                                                    dd_frame.show(ui, |ui| {
-                                                        // 幅はヘッダに連動させず内容に合わせる
-                                                        // （長い正式名も折返さず1行で表示）。
-                                                        egui::ScrollArea::vertical()
-                                                            .max_height(220.0)
-                                                            .show(ui, |ui| {
-                                                                if ui
-                                                                    .selectable_label(
-                                                                        sh.is_empty(),
-                                                                        "既定",
-                                                                    )
-                                                                    .clicked()
-                                                                {
-                                                                    picked = Some(String::new());
-                                                                }
-                                                                if let Some(k) = shell_list(
-                                                                    ui,
-                                                                    &self.shells,
-                                                                    &self.shell_icons,
-                                                                    sh_idx,
-                                                                ) {
-                                                                    picked = Some(
-                                                                        self.shells[k]
-                                                                            .short
-                                                                            .clone(),
-                                                                    );
-                                                                }
-                                                            });
-                                                    });
-                                                });
-                                                let arect = area.response.rect;
-                                                if let Some(p) = picked {
-                                                    self.startup_tabs[i].shell = p;
-                                                    self.startup_shell_open = None;
-                                                } else if ctx.input(|i| i.pointer.any_pressed())
-                                                {
-                                                    if let Some(pos) =
-                                                        ctx.input(|i| i.pointer.interact_pos())
-                                                    {
-                                                        if !hrect.contains(pos)
-                                                            && !arect.contains(pos)
-                                                        {
-                                                            self.startup_shell_open = None;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        });
-                                        ui.add_space(4.0);
-                                        ui.add(
-                                            egui::TextEdit::singleline(
-                                                &mut self.startup_tabs[i].cwd,
-                                            )
-                                            .hint_text("初期ディレクトリ（空＝既定）")
-                                            .desired_width(f32::INFINITY),
-                                        );
-                                        ui.add_space(4.0);
-                                        ui.add(
-                                            egui::TextEdit::multiline(
-                                                &mut self.startup_tabs[i].commands_buf,
-                                            )
-                                            .hint_text("起動コマンド（1行に1つ）")
-                                            .desired_rows(2)
-                                            .desired_width(f32::INFINITY),
-                                        );
-                                    });
-                                // カード矩形を記録し、左端の余白にドラッグハンドル（点）を描く。
-                                let card_rect = card_resp.response.rect;
-                                card_rects.push(card_rect);
-                                // パネル端側の余白を [アクセントバー｜ハンドル点｜内容] と
-                                // 等間隔に割り付ける。handle_rect＝ドラッグ判定（余白全体）。
-                                let (handle_rect, dots_rect, abar) = if panel_right {
-                                    let r = card_rect.right();
-                                    (
-                                        egui::Rect::from_min_max(
-                                            Pos2::new(r - 30.0, card_rect.top()),
-                                            card_rect.right_bottom(),
-                                        ),
-                                        egui::Rect::from_min_max(
-                                            Pos2::new(r - 25.0, card_rect.top()),
-                                            Pos2::new(r - 13.0, card_rect.bottom()),
-                                        ),
-                                        egui::Rect::from_min_max(
-                                            Pos2::new(r - 8.0, card_rect.top() + 6.0),
-                                            Pos2::new(r - 5.0, card_rect.bottom() - 6.0),
-                                        ),
-                                    )
-                                } else {
-                                    let l = card_rect.left();
-                                    (
-                                        egui::Rect::from_min_max(
-                                            card_rect.left_top(),
-                                            Pos2::new(l + 30.0, card_rect.bottom()),
-                                        ),
-                                        egui::Rect::from_min_max(
-                                            Pos2::new(l + 13.0, card_rect.top()),
-                                            Pos2::new(l + 25.0, card_rect.bottom()),
-                                        ),
-                                        egui::Rect::from_min_max(
-                                            Pos2::new(l + 5.0, card_rect.top() + 6.0),
-                                            Pos2::new(l + 8.0, card_rect.bottom() - 6.0),
-                                        ),
-                                    )
-                                };
-                                let hresp = ui.interact(
-                                    handle_rect,
-                                    egui::Id::new(("card_grip", i)),
-                                    Sense::drag(),
+                                // 行ごとにマニュアル／プリセット参照を切替（tab_spec_card にトグルを渡す）。
+                                let entry = &mut self.startup[i];
+                                let (act, rect) = tab_spec_card(
+                                    ui,
+                                    ctx,
+                                    "startup",
+                                    i,
+                                    &mut entry.spec,
+                                    &self.shells,
+                                    &self.shell_icons,
+                                    self.default_bg,
+                                    self.default_accent,
+                                    panel_right,
+                                    &mut self.startup_shell_open,
+                                    &mut self.startup_color_open,
+                                    &mut self.card_drag,
+                                    pointer,
+                                    false,
+                                    Some(StartupToggle {
+                                        use_preset: &mut entry.use_preset,
+                                        preset_ref: &mut entry.preset,
+                                        presets: &self.presets,
+                                        pick_open: &mut self.startup_pick_open,
+                                    }),
                                 );
-                                let grip_col = if dragging_this || hresp.hovered() {
-                                    TAB_TEXT_ACTIVE
-                                } else {
-                                    Color32::from_gray(90)
-                                };
-                                draw_grip_dots(ui.painter(), dots_rect, grip_col);
-                                ui.painter().rect_filled(abar, 2.0, res_accent);
-                                if hresp.hovered() || dragging_this {
-                                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                                card_rects.push(rect);
+                                match act {
+                                    CardAction::Remove => to_remove = Some(i),
+                                    CardAction::Move(d) => to_move = Some((i, d)),
+                                    _ => {}
                                 }
-                                if hresp.drag_started() {
-                                    if let Some(p) = pointer {
-                                        self.card_drag = Some(TabDrag {
-                                            from: i,
-                                            grab_dy: p.y - card_rect.top(),
-                                        });
-                                    }
-                                }
-                                ui.add_space(6.0);
                             }
 
-                            // ---- D&D：挿入線＋前面ゴースト、ドロップで確定 ----
-                            if let Some(drag) = self.card_drag {
-                                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-                                let released = ui.input(|i| !i.pointer.any_down());
-                                if let (Some(p), true) = (pointer, drag.from < card_rects.len()) {
-                                    // 可視範囲の上下端に持っていったら自動スクロール（端に近いほど速い）。
-                                    let clip = ui.clip_rect();
-                                    let edge = 30.0;
-                                    if p.y > clip.bottom() - edge {
-                                        let s = ((p.y - (clip.bottom() - edge)) / edge).clamp(0.0, 1.0);
-                                        ui.scroll_with_delta(Vec2::new(0.0, -(2.0 + 12.0 * s)));
-                                    } else if p.y < clip.top() + edge {
-                                        let s = (((clip.top() + edge) - p.y) / edge).clamp(0.0, 1.0);
-                                        ui.scroll_with_delta(Vec2::new(0.0, 2.0 + 12.0 * s));
-                                    }
-                                    let target =
-                                        card_rects.iter().filter(|r| p.y > r.center().y).count();
-                                    let (x0, x1) = card_rects
-                                        .first()
-                                        .map(|r| (r.left(), r.right()))
-                                        .unwrap_or((0.0, 0.0));
-                                    let line_y = if target < card_rects.len() {
-                                        card_rects[target].top() - 3.0
-                                    } else {
-                                        card_rects.last().map_or(0.0, |r| r.bottom() + 2.0)
-                                    };
-                                    ui.painter().hline(
-                                        egui::Rangef::new(x0, x1),
-                                        line_y,
-                                        egui::Stroke::new(2.0, ACCENT_GREEN),
-                                    );
-                                    // ゴースト：掴んだカードの実物を再現して前面に追従させる
-                                    let card_h = card_rects[drag.from].height();
-                                    let top = p.y - drag.grab_dy;
-                                    let grect = egui::Rect::from_min_size(
-                                        Pos2::new(x0, top),
-                                        Vec2::new(x1 - x0, card_h),
-                                    );
-                                    let gp = ui.ctx().layer_painter(egui::LayerId::new(
-                                        egui::Order::Tooltip,
-                                        egui::Id::new("card_drag_ghost"),
-                                    ));
-                                    if let Some(tab) = self.startup_tabs.get(drag.from) {
-                                        let gbg =
-                                            color_from_hex(&tab.bg).unwrap_or(self.default_bg);
-                                        let gac = color_from_hex(&tab.accent)
-                                            .unwrap_or(self.default_accent);
-                                        draw_card_ghost(
-                                            &gp,
-                                            grect,
-                                            tab,
-                                            &self.shells,
-                                            &self.shell_icons,
-                                            panel_right,
-                                            gbg,
-                                            gac,
-                                        );
-                                    }
-                                    if released {
-                                        move_card(&mut self.startup_tabs, drag.from, target);
-                                    }
-                                }
-                                if released {
-                                    self.card_drag = None;
-                                }
-                                ui.ctx().request_repaint();
+                            // D&D：掴んだカードの内容をクローンしてゴーストへ渡し、ドロップで移動確定。
+                            let ghost = self
+                                .card_drag
+                                .and_then(|d| self.startup.get(d.from))
+                                .map(|e| {
+                                    let gbg =
+                                        color_from_hex(&e.spec.bg).unwrap_or(self.default_bg);
+                                    let gac = color_from_hex(&e.spec.accent)
+                                        .unwrap_or(self.default_accent);
+                                    (e.spec.clone(), gbg, gac)
+                                });
+                            if let Some((from, target)) = card_dnd_resolve(
+                                ui,
+                                &mut self.card_drag,
+                                &card_rects,
+                                pointer,
+                                panel_right,
+                                ghost,
+                                &self.shells,
+                                &self.shell_icons,
+                            ) {
+                                move_card(&mut self.startup, from, target);
                             }
                         });
                     if let Some(i) = to_remove
-                        && i < self.startup_tabs.len()
+                        && i < self.startup.len()
                     {
-                        self.startup_tabs.remove(i);
+                        self.startup.remove(i);
                     }
                     if let Some((i, dir)) = to_move {
                         let j = i as isize + dir;
-                        if j >= 0 && (j as usize) < self.startup_tabs.len() {
-                            self.startup_tabs.swap(i, j as usize);
+                        if j >= 0 && (j as usize) < self.startup.len() {
+                            self.startup.swap(i, j as usize);
                         }
                     }
                 }
@@ -2574,6 +2674,8 @@ impl App {
                     settings_nav_item(ui, &mut self.settings_tab, SettingsTab::General, "既定", true);
                     ui.add_space(2.0);
                     settings_nav_item(ui, &mut self.settings_tab, SettingsTab::Theme, "UI/テーマ", true);
+                    ui.add_space(2.0);
+                    settings_nav_item(ui, &mut self.settings_tab, SettingsTab::Presets, "プリセット", true);
                     ui.add_space(2.0);
                     settings_nav_item(ui, &mut self.settings_tab, SettingsTab::Startup, "起動タブ", true);
                     ui.add_space(2.0);
@@ -2774,8 +2876,28 @@ fn color_swatch(ui: &mut egui::Ui, color: Color32) -> egui::Response {
 
 // 1セッション→起動タブ定義へ変換（スナップショット／右クリック追加で共用）。
 // コマンドは追跡していないので空。
-fn startup_tab_of(s: &Session) -> StartupTab {
-    StartupTab {
+// プリセット名を一意にする。base が空なら既定名に、既存と衝突するなら " 2"," 3"… を付す。
+// 追加・複製で使い、生成名が既存プリセットと被らないことを保証する（名前＝参照キーのため）。
+fn unique_preset_name(base: &str, existing: &[TabSpec]) -> String {
+    let base = base.trim();
+    let base = if base.is_empty() { "プリセット" } else { base };
+    let taken: std::collections::HashSet<&str> =
+        existing.iter().map(|p| p.name.as_str()).collect();
+    if !taken.contains(base) {
+        return base.to_string();
+    }
+    let mut k = 2;
+    loop {
+        let cand = format!("{base} {k}");
+        if !taken.contains(cand.as_str()) {
+            return cand;
+        }
+        k += 1;
+    }
+}
+
+fn tab_spec_of(s: &Session) -> TabSpec {
+    TabSpec {
         name: s.title.clone(),
         shell: s.shell_short.clone(),
         cwd: s.cwd.clone(),
@@ -2817,6 +2939,44 @@ fn settings_btn(ui: &mut egui::Ui, label: &str, fill: Color32, border: Color32) 
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     resp.clicked()
+}
+
+// モード切替トグル1個ぶん（マニュアル／プリセット）。Material アイコンのみの正方ボタンで、
+// 自前描画によりサイズ・位置を固定（縮み・ズレを防ぐ）。選択中はアクセント枠＋明るい地・
+// 明色グリフ、非選択は暗め。文字なしなので tip をホバーのツールチップに出して意味を補う。
+fn mode_toggle_btn(ui: &mut egui::Ui, glyph: &str, tip: &str, selected: bool) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
+    let hovered = resp.hovered();
+    let base = if selected {
+        Color32::from_gray(56)
+    } else {
+        Color32::from_gray(34)
+    };
+    let bg = if hovered {
+        Color32::from_rgb(
+            base.r().saturating_add(14),
+            base.g().saturating_add(14),
+            base.b().saturating_add(14),
+        )
+    } else {
+        base
+    };
+    let fg = if selected || hovered {
+        TAB_TEXT_ACTIVE
+    } else {
+        Color32::from_gray(170)
+    };
+    let border = if selected { ACCENT_GREEN } else { Color32::from_gray(60) };
+    let galley =
+        ui.ctx()
+            .fonts_mut(|f| f.layout_no_wrap(glyph.to_owned(), FontId::proportional(18.0), fg));
+    let painter = ui.painter();
+    painter.rect(rect, 6.0, bg, egui::Stroke::new(1.0, border), egui::StrokeKind::Inside);
+    painter.galley(rect.center() - galley.size() * 0.5, galley, fg);
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp.on_hover_text(tip).clicked()
 }
 
 // 主アクション（やや明るい地）／副次・中立アクション（暗い地）。緑は選択専用なので使わない。
@@ -2869,11 +3029,529 @@ fn ghost_field(painter: &egui::Painter, rect: egui::Rect, text: &str, hint: &str
     );
 }
 
+// カード編集で発生する操作。呼び元がリストに対して適用する。
+#[derive(Clone, Copy, PartialEq)]
+enum CardAction {
+    None,
+    Remove,
+    Move(isize),
+    Duplicate,
+}
+
+// 起動タブ行のモード切替に要る参照束。プリセットペインでは None（トグル無し・常にエディタ）。
+struct StartupToggle<'a> {
+    use_preset: &'a mut bool,         // 参照モードか
+    preset_ref: &'a mut String,       // 選択中のプリセット名（未選択なら空）
+    presets: &'a [TabSpec],           // 選択肢＆プレビューの解決元
+    pick_open: &'a mut Option<usize>, // プリセット選択DDを開いているカード
+}
+
+// タブ定義カード1枚の編集UI（名前・シェルDD・色パレット・cwd・コマンド＋操作ボタン）と
+// ドラッググリップを描く。起動タブとプリセットで共用＝見た目と操作を1本化する。
+// ポップアップの開閉状態・ドラッグ状態は呼び元が保持し、参照で受け渡す。id_scope で Area ID を
+// リストごとに分ける（衝突回避）。show_duplicate＝複製ボタンを出すか（プリセット側のみ）。
+// toggle=Some のとき先頭にモードトグルを出し、参照モードなら項目エディタの代わりにプリセット
+// 選択＋プレビューを描く。プリセット→マニュアルはその型を spec にコピー、マニュアル→プリセットは
+// 未選択にする。返り値：発生した操作と、このカードの矩形（呼び元の D&D 判定に使う）。
+#[allow(clippy::too_many_arguments)]
+fn tab_spec_card(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    id_scope: &str,
+    i: usize,
+    spec: &mut TabSpec,
+    shells: &[ShellSpec],
+    shell_icons: &[Option<egui::TextureHandle>],
+    default_bg: Color32,
+    default_accent: Color32,
+    panel_right: bool,
+    shell_open: &mut Option<usize>,
+    color_open: &mut Option<(usize, bool)>,
+    card_drag: &mut Option<TabDrag>,
+    pointer: Option<Pos2>,
+    show_duplicate: bool,
+    mut toggle: Option<StartupToggle<'_>>,
+) -> (CardAction, egui::Rect) {
+    let mut action = CardAction::None;
+    let dragging_this = card_drag.map_or(false, |d| d.from == i);
+    // カードの色＝実体化したタブの見た目（bg＝塗り、accent＝枠）。参照モードは解決した型の色を、
+    // マニュアルは spec の色を使う（未指定は既定にフォールバック）。
+    let disp: Option<&TabSpec> = match &toggle {
+        Some(t) if *t.use_preset => t.presets.iter().find(|p| p.name == *t.preset_ref),
+        _ => None,
+    };
+    let (bg_s, ac_s) = match disp {
+        Some(p) => (p.bg.as_str(), p.accent.as_str()),
+        None => (spec.bg.as_str(), spec.accent.as_str()),
+    };
+    let res_bg = color_from_hex(bg_s).unwrap_or(default_bg);
+    let res_accent = color_from_hex(ac_s).unwrap_or(default_accent);
+    let bg_disp = BG_APPLY
+        .iter()
+        .position(|c| *c == res_bg)
+        .map(|k| BG_DISPLAY[k])
+        .unwrap_or(res_bg);
+    // 左端（or 右端）にドラッグハンドルぶんの余白（30px）を確保。
+    let card_resp = egui::Frame::new()
+        .fill(if dragging_this {
+            res_bg.gamma_multiply(0.6)
+        } else {
+            res_bg
+        })
+        .stroke(egui::Stroke::new(1.0, Color32::from_gray(55)))
+        .corner_radius(6.0)
+        .inner_margin(if panel_right {
+            egui::Margin { left: 8, right: 30, top: 8, bottom: 8 }
+        } else {
+            egui::Margin { left: 30, right: 8, top: 8, bottom: 8 }
+        })
+        .show(ui, |ui| {
+            let mut preset_mode = toggle.as_ref().map_or(false, |t| *t.use_preset);
+            ui.horizontal(|ui| {
+                // モードトグル（マニュアル / プリセット）。切替時に spec / 参照を整える。
+                if let Some(t) = toggle.as_mut() {
+                    // \u{e3c9}=edit（マニュアル＝その場編集）／\u{e866}=bookmark（プリセット＝保存した型）
+                    if mode_toggle_btn(ui, "\u{e3c9}", "マニュアル", !*t.use_preset) && *t.use_preset
+                    {
+                        // プリセット→マニュアル：参照していた型の内容を spec にコピー。
+                        if let Some(p) = t.presets.iter().find(|p| p.name == *t.preset_ref) {
+                            let mut c = p.clone();
+                            c.sync_buf_from_commands();
+                            *spec = c;
+                        }
+                        *t.use_preset = false;
+                        *t.preset_ref = String::new();
+                    }
+                    ui.add_space(2.0);
+                    if mode_toggle_btn(ui, "\u{e866}", "プリセット", *t.use_preset) && !*t.use_preset
+                    {
+                        // マニュアル→プリセット：未選択にする（自動で先頭を選ばない）。
+                        *t.use_preset = true;
+                        *t.preset_ref = String::new();
+                    }
+                    ui.add_space(8.0);
+                }
+                preset_mode = toggle.as_ref().map_or(false, |t| *t.use_preset);
+                if preset_mode {
+                    // ---- 参照モード：プリセット選択＋プレビュー（読み取り専用） ----
+                    let t = toggle.as_mut().unwrap();
+                    let cur = t.preset_ref.clone();
+                    let sel = t.presets.iter().find(|p| p.name == cur);
+                    let label = if cur.is_empty() {
+                        "（未選択）".to_string()
+                    } else if sel.is_some() {
+                        cur.clone()
+                    } else {
+                        format!("⚠ {cur}")
+                    };
+                    let open = *t.pick_open == Some(i);
+                    let arrow = if open { "▲" } else { "▼" };
+                    let picker =
+                        ui.add_sized([220.0, 28.0], egui::Button::new(format!("{label}　{arrow}")));
+                    let brect = picker.rect;
+                    if picker.clicked() {
+                        *t.pick_open = if open { None } else { Some(i) };
+                    }
+                    // 解決先の色はカード枠（bg 塗り＋アクセントバー）が示すので、ここでは
+                    // プレビューを重ねない（冗長・横幅圧迫を避ける）。
+                    // 選択ドロップダウン（未選択＋各プリセット名）。
+                    if *t.pick_open == Some(i) {
+                        let dd_frame = egui::Frame::new()
+                            .fill(Color32::from_gray(40))
+                            .stroke(egui::Stroke::new(1.0, Color32::from_gray(70)))
+                            .corner_radius(6.0)
+                            .inner_margin(egui::Margin::same(4));
+                        let mut picked: Option<String> = None;
+                        let area = egui::Area::new(egui::Id::new((id_scope, "preset_pick", i)))
+                            .order(egui::Order::Tooltip)
+                            .fixed_pos(brect.left_bottom() + Vec2::new(0.0, 2.0))
+                            .show(ctx, |ui| {
+                                dd_frame.show(ui, |ui| {
+                                    ui.set_min_width(200.0);
+                                    egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                                        if ui.selectable_label(cur.is_empty(), "（未選択）").clicked()
+                                        {
+                                            picked = Some(String::new());
+                                        }
+                                        for p in t.presets {
+                                            if p.name.trim().is_empty() {
+                                                continue;
+                                            }
+                                            if ui
+                                                .selectable_label(p.name == cur, p.name.as_str())
+                                                .clicked()
+                                            {
+                                                picked = Some(p.name.clone());
+                                            }
+                                        }
+                                    });
+                                });
+                            });
+                        let arect = area.response.rect;
+                        if let Some(pn) = picked {
+                            *t.preset_ref = pn;
+                            *t.pick_open = None;
+                        } else if ctx.input(|i| i.pointer.any_pressed()) {
+                            if let Some(pp) = ctx.input(|i| i.pointer.interact_pos()) {
+                                if !brect.contains(pp) && !arect.contains(pp) {
+                                    *t.pick_open = None;
+                                }
+                            }
+                        }
+                    }
+                    // 操作ボタン（削除・並べ替え）。参照モードに複製は無し。
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if settings_icon_btn(ui, "\u{e872}", true) {
+                            action = CardAction::Remove;
+                        }
+                        ui.add_space(2.0);
+                        if settings_icon_btn(ui, "\u{e5db}", false) {
+                            action = CardAction::Move(1);
+                        }
+                        ui.add_space(2.0);
+                        if settings_icon_btn(ui, "\u{e5d8}", false) {
+                            action = CardAction::Move(-1);
+                        }
+                    });
+                } else {
+                    ui.add_sized(
+                        [150.0, 28.0],
+                        egui::TextEdit::singleline(&mut spec.name)
+                            .hint_text("名前")
+                            .vertical_align(egui::Align::Center),
+                    );
+                    ui.add_space(6.0);
+                    // シェル選択(既定タブと同じ前面ドロップダウン)
+                    let sh = spec.shell.clone();
+                    let sh_idx = if sh.is_empty() {
+                        None
+                    } else {
+                        shells.iter().position(|s| s.short == sh)
+                    };
+                    let sh_label = match sh_idx {
+                        Some(k) => shells[k].short.clone(),
+                        None => "既定".to_string(),
+                    };
+                    let open = *shell_open == Some(i);
+                    let arrow = if open { "▲" } else { "▼" };
+                    let htext = format!("{sh_label}　{arrow}");
+                    let header = match sh_idx
+                        .and_then(|k| shell_icons.get(k))
+                        .and_then(|o| o.as_ref())
+                    {
+                        Some(tex) => {
+                            let img = egui::Image::new(tex).fit_to_exact_size(Vec2::splat(16.0));
+                            ui.add_sized([170.0, 28.0], egui::Button::image_and_text(img, htext))
+                        }
+                        None => ui.add_sized([170.0, 28.0], egui::Button::new(htext)),
+                    };
+                    let hrect = header.rect;
+                    if header.clicked() {
+                        *shell_open = if open { None } else { Some(i) };
+                    }
+                    // 色スウォッチ(bg＝表示色／accent)。クリックでパレット。
+                    ui.add_space(6.0);
+                    let bg_resp = color_swatch(ui, bg_disp);
+                    if bg_resp.clicked() {
+                        *color_open = if *color_open == Some((i, false)) {
+                            None
+                        } else {
+                            Some((i, false))
+                        };
+                    }
+                    ui.add_space(4.0);
+                    let ac_resp = color_swatch(ui, res_accent);
+                    if ac_resp.clicked() {
+                        *color_open = if *color_open == Some((i, true)) {
+                            None
+                        } else {
+                            Some((i, true))
+                        };
+                    }
+                    // 色パレットのポップアップ(bg / accent)
+                    let pop_frame = egui::Frame::new()
+                        .fill(Color32::from_gray(40))
+                        .stroke(egui::Stroke::new(1.0, Color32::from_gray(70)))
+                        .corner_radius(6.0)
+                        .inner_margin(egui::Margin::same(6));
+                    if *color_open == Some((i, false)) {
+                        let mut pick: Option<Option<Color32>> = None;
+                        let area = egui::Area::new(egui::Id::new((id_scope, "bg_pop", i)))
+                            .order(egui::Order::Tooltip)
+                            .fixed_pos(bg_resp.rect.left_bottom() + Vec2::new(0.0, 2.0))
+                            .show(ctx, |ui| {
+                                pop_frame.show(ui, |ui| {
+                                    ui.set_width(176.0);
+                                    if ui.selectable_label(spec.bg.is_empty(), "既定").clicked() {
+                                        pick = Some(None);
+                                    }
+                                    if let Some(c) =
+                                        palette_picker(ui, &BG_DISPLAY, &BG_APPLY, res_bg)
+                                    {
+                                        pick = Some(Some(c));
+                                    }
+                                });
+                            });
+                        let arect = area.response.rect;
+                        if let Some(sel) = pick {
+                            spec.bg = match sel {
+                                Some(c) => color_to_hex(c),
+                                None => String::new(),
+                            };
+                            *color_open = None;
+                        } else if ctx.input(|i| i.pointer.any_pressed()) {
+                            if let Some(p) = ctx.input(|i| i.pointer.interact_pos()) {
+                                if !bg_resp.rect.contains(p) && !arect.contains(p) {
+                                    *color_open = None;
+                                }
+                            }
+                        }
+                    }
+                    if *color_open == Some((i, true)) {
+                        let mut pick: Option<Option<Color32>> = None;
+                        let area = egui::Area::new(egui::Id::new((id_scope, "ac_pop", i)))
+                            .order(egui::Order::Tooltip)
+                            .fixed_pos(ac_resp.rect.left_bottom() + Vec2::new(0.0, 2.0))
+                            .show(ctx, |ui| {
+                                pop_frame.show(ui, |ui| {
+                                    ui.set_width(176.0);
+                                    if ui.selectable_label(spec.accent.is_empty(), "既定").clicked()
+                                    {
+                                        pick = Some(None);
+                                    }
+                                    if let Some(c) = palette_picker(
+                                        ui,
+                                        &ACCENT_PALETTE,
+                                        &ACCENT_PALETTE,
+                                        res_accent,
+                                    ) {
+                                        pick = Some(Some(c));
+                                    }
+                                });
+                            });
+                        let arect = area.response.rect;
+                        if let Some(sel) = pick {
+                            spec.accent = match sel {
+                                Some(c) => color_to_hex(c),
+                                None => String::new(),
+                            };
+                            *color_open = None;
+                        } else if ctx.input(|i| i.pointer.any_pressed()) {
+                            if let Some(p) = ctx.input(|i| i.pointer.interact_pos()) {
+                                if !ac_resp.rect.contains(p) && !arect.contains(p) {
+                                    *color_open = None;
+                                }
+                            }
+                        }
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // ゴミ箱＝削除、(プリセットのみ)複製、太い上下矢印＝並べ替え
+                        if settings_icon_btn(ui, "\u{e872}", true) {
+                            action = CardAction::Remove;
+                        }
+                        ui.add_space(2.0);
+                        if show_duplicate {
+                            if settings_icon_btn(ui, "\u{e14d}", false) {
+                                action = CardAction::Duplicate;
+                            }
+                            ui.add_space(2.0);
+                        }
+                        if settings_icon_btn(ui, "\u{e5db}", false) {
+                            action = CardAction::Move(1);
+                        }
+                        ui.add_space(2.0);
+                        if settings_icon_btn(ui, "\u{e5d8}", false) {
+                            action = CardAction::Move(-1);
+                        }
+                    });
+
+                    // 前面ドロップダウン(このカードが開いている時)
+                    if *shell_open == Some(i) {
+                        let dd_frame = egui::Frame::new()
+                            .fill(Color32::from_gray(40))
+                            .stroke(egui::Stroke::new(1.0, Color32::from_gray(70)))
+                            .corner_radius(6.0)
+                            .inner_margin(egui::Margin::same(4));
+                        let mut picked: Option<String> = None;
+                        let area = egui::Area::new(egui::Id::new((id_scope, "shell_dd", i)))
+                            .order(egui::Order::Tooltip)
+                            .fixed_pos(hrect.left_bottom() + Vec2::new(0.0, 2.0))
+                            .show(ctx, |ui| {
+                                dd_frame.show(ui, |ui| {
+                                    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                                        if ui.selectable_label(sh.is_empty(), "既定").clicked() {
+                                            picked = Some(String::new());
+                                        }
+                                        if let Some(k) = shell_list(ui, shells, shell_icons, sh_idx)
+                                        {
+                                            picked = Some(shells[k].short.clone());
+                                        }
+                                    });
+                                });
+                            });
+                        let arect = area.response.rect;
+                        if let Some(p) = picked {
+                            spec.shell = p;
+                            *shell_open = None;
+                        } else if ctx.input(|i| i.pointer.any_pressed()) {
+                            if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
+                                if !hrect.contains(pos) && !arect.contains(pos) {
+                                    *shell_open = None;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+            // マニュアルのみ cwd／コマンドを出す（参照モードは型が持つ）。
+            if !preset_mode {
+                ui.add_space(4.0);
+                ui.add(
+                    egui::TextEdit::singleline(&mut spec.cwd)
+                        .hint_text("初期ディレクトリ（空＝既定）")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(4.0);
+                ui.add(
+                    egui::TextEdit::multiline(&mut spec.commands_buf)
+                        .hint_text("起動コマンド（1行に1つ）")
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY),
+                );
+            }
+        });
+    // カード矩形を記録し、端の余白にドラッグハンドル（点）＋アクセントバーを描く。
+    let card_rect = card_resp.response.rect;
+    let (handle_rect, dots_rect, abar) = if panel_right {
+        let r = card_rect.right();
+        (
+            egui::Rect::from_min_max(
+                Pos2::new(r - 30.0, card_rect.top()),
+                card_rect.right_bottom(),
+            ),
+            egui::Rect::from_min_max(
+                Pos2::new(r - 25.0, card_rect.top()),
+                Pos2::new(r - 13.0, card_rect.bottom()),
+            ),
+            egui::Rect::from_min_max(
+                Pos2::new(r - 8.0, card_rect.top() + 6.0),
+                Pos2::new(r - 5.0, card_rect.bottom() - 6.0),
+            ),
+        )
+    } else {
+        let l = card_rect.left();
+        (
+            egui::Rect::from_min_max(
+                card_rect.left_top(),
+                Pos2::new(l + 30.0, card_rect.bottom()),
+            ),
+            egui::Rect::from_min_max(
+                Pos2::new(l + 13.0, card_rect.top()),
+                Pos2::new(l + 25.0, card_rect.bottom()),
+            ),
+            egui::Rect::from_min_max(
+                Pos2::new(l + 5.0, card_rect.top() + 6.0),
+                Pos2::new(l + 8.0, card_rect.bottom() - 6.0),
+            ),
+        )
+    };
+    let hresp = ui.interact(
+        handle_rect,
+        egui::Id::new((id_scope, "card_grip", i)),
+        Sense::drag(),
+    );
+    let grip_col = if dragging_this || hresp.hovered() {
+        TAB_TEXT_ACTIVE
+    } else {
+        Color32::from_gray(90)
+    };
+    draw_grip_dots(ui.painter(), dots_rect, grip_col);
+    ui.painter().rect_filled(abar, 2.0, res_accent);
+    if hresp.hovered() || dragging_this {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    }
+    if hresp.drag_started() {
+        if let Some(p) = pointer {
+            *card_drag = Some(TabDrag { from: i, grab_dy: p.y - card_rect.top() });
+        }
+    }
+    ui.add_space(6.0);
+    (action, card_rect)
+}
+
+// カードリストの D&D を確定する。挿入線とゴーストを描き、ドロップされたら移動 (from, target) を返す。
+// ghost＝掴んだカードの内容と色（呼び元がクローンして渡す）。tab_spec_card と対で使う。
+#[allow(clippy::too_many_arguments)]
+fn card_dnd_resolve(
+    ui: &mut egui::Ui,
+    card_drag: &mut Option<TabDrag>,
+    card_rects: &[egui::Rect],
+    pointer: Option<Pos2>,
+    panel_right: bool,
+    ghost: Option<(TabSpec, Color32, Color32)>,
+    shells: &[ShellSpec],
+    shell_icons: &[Option<egui::TextureHandle>],
+) -> Option<(usize, usize)> {
+    let mut do_move = None;
+    if let Some(drag) = *card_drag {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        let released = ui.input(|i| !i.pointer.any_down());
+        if let (Some(p), true) = (pointer, drag.from < card_rects.len()) {
+            // 可視範囲の上下端に持っていったら自動スクロール（端に近いほど速い）。
+            let clip = ui.clip_rect();
+            let edge = 30.0;
+            if p.y > clip.bottom() - edge {
+                let s = ((p.y - (clip.bottom() - edge)) / edge).clamp(0.0, 1.0);
+                ui.scroll_with_delta(Vec2::new(0.0, -(2.0 + 12.0 * s)));
+            } else if p.y < clip.top() + edge {
+                let s = (((clip.top() + edge) - p.y) / edge).clamp(0.0, 1.0);
+                ui.scroll_with_delta(Vec2::new(0.0, 2.0 + 12.0 * s));
+            }
+            let target = card_rects.iter().filter(|r| p.y > r.center().y).count();
+            let (x0, x1) = card_rects
+                .first()
+                .map(|r| (r.left(), r.right()))
+                .unwrap_or((0.0, 0.0));
+            let line_y = if target < card_rects.len() {
+                card_rects[target].top() - 3.0
+            } else {
+                card_rects.last().map_or(0.0, |r| r.bottom() + 2.0)
+            };
+            ui.painter().hline(
+                egui::Rangef::new(x0, x1),
+                line_y,
+                egui::Stroke::new(2.0, ACCENT_GREEN),
+            );
+            // ゴースト：掴んだカードの実物を再現して前面に追従させる
+            let card_h = card_rects[drag.from].height();
+            let top = p.y - drag.grab_dy;
+            let grect = egui::Rect::from_min_size(Pos2::new(x0, top), Vec2::new(x1 - x0, card_h));
+            let gp = ui.ctx().layer_painter(egui::LayerId::new(
+                egui::Order::Tooltip,
+                egui::Id::new("card_drag_ghost"),
+            ));
+            if let Some((tab, gbg, gac)) = &ghost {
+                draw_card_ghost(
+                    &gp, grect, tab, shells, shell_icons, panel_right, *gbg, *gac,
+                );
+            }
+            if released {
+                do_move = Some((drag.from, target));
+            }
+        }
+        if released {
+            *card_drag = None;
+        }
+        ui.ctx().request_repaint();
+    }
+    do_move
+}
+
 // ドラッグ中のゴースト＝掴んだカードの実物を半透明で再現（名前/シェル/cwd/コマンド）。
 fn draw_card_ghost(
     painter: &egui::Painter,
     rect: egui::Rect,
-    tab: &StartupTab,
+    tab: &TabSpec,
     shells: &[ShellSpec],
     icons: &[Option<egui::TextureHandle>],
     mirror: bool,
@@ -2985,7 +3663,7 @@ fn draw_card_ghost(
 }
 
 // 起動タブカードを from から target（挿入境界 0..=len）へ移動。move_tab と同じ補正。
-fn move_card(tabs: &mut Vec<StartupTab>, from: usize, target: usize) {
+fn move_card<T>(tabs: &mut Vec<T>, from: usize, target: usize) {
     if from >= tabs.len() {
         return;
     }
@@ -3124,6 +3802,37 @@ impl eframe::App for App {
                     IpcMsg::RunScript(p) => self.open_script_tab(&ctx, &p),
                 }
             }
+        }
+
+        // ウィンドウへのファイル D&D ＝右クリック「LustTermina で開く／実行」の D&D 版。
+        // フォルダ→そのフォルダで開く、スクリプト→設定シェルで実行、その他ファイル→親フォルダを開く。
+        // 借用を切るため先にパスを集めてから処理する（open_* が self を可変借用するため）。
+        let dropped: Vec<std::path::PathBuf> =
+            ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        for path in dropped {
+            if path.is_dir() {
+                self.open_dir_tab(&ctx, &path.to_string_lossy());
+            } else if is_script_path(&path) {
+                self.open_script_tab(&ctx, &path.to_string_lossy());
+            } else if let Some(parent) = path.parent().and_then(|d| d.to_str()) {
+                self.open_dir_tab(&ctx, parent);
+            }
+        }
+        // ドラッグ中は全面オーバーレイで「ドロップで何が起きるか」を予告する。
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            let screen = ui.max_rect();
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("drop_overlay"),
+            ));
+            painter.rect_filled(screen, 0.0, Color32::from_black_alpha(150));
+            painter.text(
+                screen.center(),
+                egui::Align2::CENTER_CENTER,
+                "ドロップで開く（スクリプトは実行）",
+                FontId::proportional(20.0),
+                TAB_TEXT_ACTIVE,
+            );
         }
 
         // Ctrl+Tab で一つ下、Ctrl+Shift+Tab で一つ上のタブへ（端は循環）
@@ -3385,7 +4094,8 @@ impl eframe::App for App {
                                 )
                                 .fill(Color32::from_gray(30)),
                             );
-                            // クリックでシェル選択メニュー（アイコン付きリストは共通ヘルパ）
+                            // クリックでシェル選択メニュー（アイコン付きリストは共通ヘルパ）。
+                            // プリセットがあれば下段に並べ、選ぶと型から実体化する。
                             egui::Popup::menu(&add).show(|ui| {
                                 ui.set_min_width(170.0);
                                 let chosen = shell_list(ui, &self.shells, &self.shell_icons, None);
@@ -3405,6 +4115,42 @@ impl eframe::App for App {
                                     self.sessions.push(sess);
                                     self.active = self.sessions.len() - 1;
                                 }
+                                if !self.presets.is_empty() {
+                                    ui.separator();
+                                    ui.label(
+                                        egui::RichText::new("プリセット")
+                                            .color(Color32::from_gray(140))
+                                            .size(11.0),
+                                    );
+                                    let mut chosen_preset: Option<usize> = None;
+                                    for (pi, p) in self.presets.iter().enumerate() {
+                                        // 名前が空の型は参照できないので出さない（silent fail 回避）。
+                                        if p.name.trim().is_empty() {
+                                            continue;
+                                        }
+                                        let sidx = self.shells.iter().position(|s| s.short == p.shell);
+                                        let btn = match sidx
+                                            .and_then(|k| self.shell_icons.get(k))
+                                            .and_then(|o| o.as_ref())
+                                        {
+                                            Some(tex) => {
+                                                let img = egui::Image::new(tex)
+                                                    .fit_to_exact_size(Vec2::splat(16.0));
+                                                egui::Button::image_and_text(img, p.name.as_str())
+                                                    .fill(Color32::TRANSPARENT)
+                                            }
+                                            None => egui::Button::new(p.name.as_str())
+                                                .fill(Color32::TRANSPARENT),
+                                        };
+                                        if ui.add(btn).clicked() {
+                                            chosen_preset = Some(pi);
+                                        }
+                                    }
+                                    if let Some(pi) = chosen_preset {
+                                        let spec = self.presets[pi].clone();
+                                        self.spawn_tab_from_spec(&ctx, &spec);
+                                    }
+                                }
                             });
                         });
 
@@ -3421,14 +4167,16 @@ impl eframe::App for App {
         // 完全に同一の定義が既にあれば重複追加しない。
         if let Some(i) = to_add_startup {
             if let Some(s) = self.sessions.get(i) {
-                let st = startup_tab_of(s);
-                // 名前・シェル・cwd が一致する起動タブが既にあれば重複追加しない。
-                let dup = self
-                    .startup_tabs
-                    .iter()
-                    .any(|e| e.name == st.name && e.shell == st.shell && e.cwd == st.cwd);
+                let spec = tab_spec_of(s);
+                // 名前・シェル・cwd が一致するマニュアル起動エントリが既にあれば重複追加しない。
+                let dup = self.startup.iter().any(|e| {
+                    !e.is_preset()
+                        && e.spec.name == spec.name
+                        && e.spec.shell == spec.shell
+                        && e.spec.cwd == spec.cwd
+                });
                 if !dup {
-                    self.startup_tabs.push(st);
+                    self.startup.push(StartupEntry { spec, ..Default::default() });
                     self.save_settings();
                 }
             }
@@ -3862,43 +4610,74 @@ fn script_parent(path: &str) -> String {
         .to_string()
 }
 
-// 拡張子から「そのスクリプトを実行するシェル定義」を作る。対応外は None。
-// .ps1 → PowerShell（pwsh 優先、無ければ Windows PowerShell）を -File で。
-// .bat/.cmd → cmd /k（実行後もプロンプトを残す）。
-fn script_run_shell(path: &str) -> Option<ShellSpec> {
+// 拡張子ごとの「スクリプト実行シェル」の組込み既定（short 名）。config 未設定時に使う。
+// 対応する検出シェルが無ければ script_run_shell 側で常設シェルへフォールバックする。
+fn default_runner_short(ext: &str) -> &'static str {
+    match ext {
+        "ps1" => "pwsh", // 無ければ powershell（常設）へ
+        "sh" => "bash",  // 将来 .sh 対応時（Git Bash）
+        _ => "cmd",      // bat/cmd 等
+    }
+}
+
+// 選んだシェル種別（short）でスクリプト path を実行する引数。種別ごとの流儀を一箇所に集約。
+// 実行後もシェルを残す（出力確認のため）。対応しない種別はパスをそのまま渡すだけ＝
+// 「対応外シェルを選んだら動かなくてもユーザーの選択」の割り切り（握り潰さず起動は試みる）。
+fn script_run_args(short: &str, path: &str) -> Vec<String> {
+    match short {
+        "pwsh" | "powershell" | "devps" => vec![
+            "-NoExit".into(),
+            "-ExecutionPolicy".into(),
+            "Bypass".into(),
+            "-File".into(),
+            path.to_string(),
+        ],
+        "cmd" | "devcmd" => vec!["/k".into(), path.to_string()],
+        "bash" | "wsl" => vec!["-c".into(), format!("'{path}'; exec bash")],
+        _ => vec![path.to_string()],
+    }
+}
+
+// パスの拡張子が「LustTermina で実行」対応（SCRIPT_EXTS）か。D&D 時の振り分けに使う。
+fn is_script_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            let e = e.to_ascii_lowercase();
+            SCRIPT_EXTS.iter().any(|x| x.trim_start_matches('.') == e)
+        })
+        .unwrap_or(false)
+}
+
+// 拡張子から「そのスクリプトを実行するシェル定義」を作る。対応外拡張子は None。
+// 実行シェルは config（拡張子→short）で選べる（未設定は組込み既定）。選んだ／既定の short が
+// 検出シェルに無ければ更にフォールバック（powershell/cmd は常設）。引数は種別ごとの流儀で作る。
+fn script_run_shell(
+    path: &str,
+    runner: &std::collections::BTreeMap<String, String>,
+    shells: &[ShellSpec],
+) -> Option<ShellSpec> {
     let ext = std::path::Path::new(path)
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())?;
-    let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
-    match ext.as_str() {
-        "ps1" => {
-            let prog = which("pwsh.exe").unwrap_or_else(|| {
-                format!("{sysroot}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")
-            });
-            Some(ShellSpec {
-                label: "PowerShell".into(),
-                short: "ps1".into(),
-                program: prog,
-                args: vec![
-                    "-NoExit".into(),
-                    "-ExecutionPolicy".into(),
-                    "Bypass".into(),
-                    "-File".into(),
-                    path.to_string(),
-                ],
-                icon_source: None,
-            })
-        }
-        "bat" | "cmd" => Some(ShellSpec {
-            label: "cmd".into(),
-            short: ext,
-            program: format!("{sysroot}\\System32\\cmd.exe"),
-            args: vec!["/k".into(), path.to_string()],
-            icon_source: None,
-        }),
-        _ => None,
+    // 対応拡張子のみ（SCRIPT_EXTS を唯一の正に）。
+    if !SCRIPT_EXTS.iter().any(|e| e.trim_start_matches('.') == ext) {
+        return None;
     }
+    // 選択（config）→ 組込み既定 の順で short を決め、検出シェルから引く。
+    let chosen = runner.get(&ext).map(String::as_str).unwrap_or_else(|| default_runner_short(&ext));
+    let base = shells
+        .iter()
+        .find(|s| s.short == chosen)
+        .or_else(|| shells.iter().find(|s| s.short == default_runner_short(&ext)))?;
+    Some(ShellSpec {
+        label: base.label.clone(),
+        short: base.short.clone(),
+        program: base.program.clone(),
+        args: script_run_args(&base.short, path),
+        icon_source: base.icon_source.clone(),
+    })
 }
 
 // スクリプト実行タブ用の Session を1つ作る。拡張子で判定できなければ既定シェルでそのフォルダを
@@ -3908,10 +4687,11 @@ fn spawn_script_session(
     path: &str,
     shells: &[ShellSpec],
     default_shell: usize,
+    runner: &std::collections::BTreeMap<String, String>,
     bg: Color32,
     accent: Color32,
 ) -> Session {
-    let spec = script_run_shell(path).unwrap_or_else(|| shells[default_shell].clone());
+    let spec = script_run_shell(path, runner, shells).unwrap_or_else(|| shells[default_shell].clone());
     let dir = script_parent(path);
     let title = std::path::Path::new(path)
         .file_name()
