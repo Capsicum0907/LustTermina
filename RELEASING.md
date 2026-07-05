@@ -21,7 +21,9 @@ remap を付けて作る。
 
 このスクリプトは `RUSTFLAGS="--remap-path-prefix=$env:USERPROFILE=C:\Users\user -C target-feature=+crt-static"`
 を付けて `cargo build --release` し、生成した `target/release/lust_termina.exe` に実ユーザー名が残って
-いないか自己検査する（残っていれば失敗して停止＝取りこぼしを防ぐ）。
+いないか自己検査する（残っていれば失敗して停止＝取りこぼしを防ぐ）。最後に、配布用の版付きファイル
+`target/release/LustTermina-v<version>-windows-x64.exe` を生成する（版番号は Cargo.toml が唯一の正。
+スクラブ済み exe のバイト同一コピーなので、これをそのまま公開に使う）。
 
 手で同じことをするなら（PowerShell）：
 
@@ -34,7 +36,7 @@ Remove-Item Env:RUSTFLAGS
 
 ## 公開
 
-1. 上で作った `target/release/lust_termina.exe` を GitHub Releases にアップロードする。
+1. 上で生成された `target/release/LustTermina-v<version>-windows-x64.exe` を GitHub Releases にアップロードする。
 2. バージョンタグ `vX.Y.Z` を push する（`git push origin main --tags` 済みなら不要）。
 
 未署名のため初回起動時に SmartScreen 警告が出るのは既知（README の該当節を参照）。
