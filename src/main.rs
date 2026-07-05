@@ -2490,6 +2490,20 @@ impl App {
 
                 // ===== システムタブ =====
                 if self.settings_tab == SettingsTab::System {
+                    ui.label(egui::RichText::new("バージョン").color(TAB_TEXT));
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "LustTermina v{}",
+                            env!("CARGO_PKG_VERSION")
+                        ))
+                        .color(Color32::from_gray(150))
+                        .size(12.0),
+                    );
+                    ui.add_space(18.0);
+                    ui.separator();
+                    ui.add_space(10.0);
+
                     ui.label(egui::RichText::new("データ").color(TAB_TEXT));
                     ui.add_space(2.0);
                     ui.label(
@@ -3763,6 +3777,55 @@ fn reg_set_sz(
     }
 }
 
+// <root>\<subkey> の名前付き REG_SZ 値を読む。無ければ None。
+fn reg_get_sz(
+    root: windows::Win32::System::Registry::HKEY,
+    subkey: &str,
+    name: &str,
+) -> Option<String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{RegGetValueW, RRF_RT_REG_SZ};
+    let subkey_w = wide_nul(subkey);
+    let name_w = wide_nul(name);
+    unsafe {
+        // まず必要バイト数（終端NUL込み）を問い合わせる。
+        let mut size: u32 = 0;
+        let rc = RegGetValueW(
+            root,
+            PCWSTR(subkey_w.as_ptr()),
+            PCWSTR(name_w.as_ptr()),
+            RRF_RT_REG_SZ,
+            None,
+            None,
+            Some(&mut size),
+        );
+        if rc != ERROR_SUCCESS || size < 2 {
+            return None;
+        }
+        let mut buf = vec![0u8; size as usize];
+        let rc2 = RegGetValueW(
+            root,
+            PCWSTR(subkey_w.as_ptr()),
+            PCWSTR(name_w.as_ptr()),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr() as *mut _),
+            Some(&mut size),
+        );
+        if rc2 != ERROR_SUCCESS {
+            return None;
+        }
+        // バイト列を UTF-16LE として解釈し、終端NULまでを文字列にする。
+        let s: Vec<u16> = buf[..(size as usize)]
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .take_while(|&c| c != 0)
+            .collect();
+        Some(String::from_utf16_lossy(&s))
+    }
+}
+
 // <root>\<subkey> をツリーごと削除。既に無い場合も成功扱い。
 fn reg_delete_tree(root: windows::Win32::System::Registry::HKEY, subkey: &str) -> bool {
     use windows::core::PCWSTR;
@@ -4011,6 +4074,23 @@ fn installed_scope() -> Option<InstallScope> {
     [InstallScope::Machine, InstallScope::PerUser]
         .into_iter()
         .find(|&s| installed_exe(s).map(|p| p.exists()).unwrap_or(false))
+}
+// インストール済みの版（「アプリと機能」の DisplayVersion）を読む。無ければ None。
+fn installed_version(scope: InstallScope) -> Option<String> {
+    reg_get_sz(scope_root(scope), UNINSTALL_KEY, "DisplayVersion")
+}
+// "a.b.c" を数値タプルにして比較。running が installed より新しければ true。
+// 末尾の -beta 等の非数値要素は無視する（数値の major.minor.patch のみで判定）。
+fn version_is_newer(running: &str, installed: &str) -> bool {
+    fn parse(v: &str) -> (u64, u64, u64) {
+        let mut it = v.split(['.', '-', '+']).filter_map(|p| p.parse::<u64>().ok());
+        (
+            it.next().unwrap_or(0),
+            it.next().unwrap_or(0),
+            it.next().unwrap_or(0),
+        )
+    }
+    parse(running) > parse(installed)
 }
 // 今このプロセスがどちらかのインストール先 exe として動いているか。
 fn running_from_install() -> bool {
@@ -4280,34 +4360,94 @@ fn perform_uninstall(scope: InstallScope, delete_config: bool) -> bool {
     }
 }
 
+// ask_install_scope の結果。導入する／導入せず今回だけ起動する／何もしない、の3択。
+enum InstallChoice {
+    Install(InstallScope), // 選んだスコープへ導入
+    OpenPortable,          // 導入せずこのまま（ポータブル）起動
+    Cancel,                // 何もしない（起動もしない）
+}
+
 // インストール確認＋インストール先の選択（TaskDialog のラジオボタン）。
-// 戻り値: None=キャンセル、Some(scope)。
-fn ask_install_scope() -> Option<InstallScope> {
+// 各ラジオに「そのスコープの現在の版」を出す（ユーザー専用／PC全体で別々に入り得るため）。
+// 既にインストール済みなら導入ボタンの文言を「更新／再インストール／ダウングレード」に切替。
+// ボタンは3系統: 導入 ／「インストールせずに開く」＝今回だけ起動 ／「キャンセル」＝何もしない。
+fn ask_install_scope() -> InstallChoice {
     use windows::core::PCWSTR;
     use windows::Win32::UI::Controls::{
         TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOG_BUTTON, TDCBF_CANCEL_BUTTON,
         TDF_ALLOW_DIALOG_CANCELLATION,
     };
     const ID_INSTALL: i32 = 1000;
+    const ID_OPEN: i32 = 1001;
     const ID_PERUSER: i32 = 201;
     const ID_MACHINE: i32 = 202;
-    let title = wide_nul("LustTermina のインストール");
-    let main = wide_nul("LustTermina をインストールしますか？");
-    let content = wide_nul(
-        "スタートメニューのショートカットと、フォルダ右クリックの「LustTermina で開く」を追加します。",
-    );
-    let r1 = wide_nul("このユーザー専用でインストール（管理者権限は不要）");
-    let r2 = wide_nul("PC 全体にインストール（管理者権限が必要）");
-    let btn = wide_nul("インストール");
+    let running_ver = env!("CARGO_PKG_VERSION");
+    // 各スコープの現在の版（exe が実在する時だけ版を読む＝実際に入っている物だけ表示）。
+    let scope_ver = |s: InstallScope| -> Option<String> {
+        if installed_exe(s).map(|p| p.exists()).unwrap_or(false) {
+            installed_version(s)
+        } else {
+            None
+        }
+    };
+    let peruser_ver = scope_ver(InstallScope::PerUser);
+    let machine_ver = scope_ver(InstallScope::Machine);
+    let existing = installed_scope();
+    let existing_ver = existing.and_then(installed_version);
+    let title = wide_nul(&format!("LustTermina v{running_ver} のインストール"));
+    // 文面は「新規インストール」と「既存への更新／再インストール」で切り替える。
+    let (main, content, btn) = match existing_ver.as_deref() {
+        Some(iv) => {
+            let verb = if version_is_newer(running_ver, iv) {
+                "更新"
+            } else if version_is_newer(iv, running_ver) {
+                "ダウングレード"
+            } else {
+                "再インストール"
+            };
+            (
+                wide_nul("LustTermina は既にインストールされています"),
+                wide_nul(&format!(
+                    "この配布物は v{running_ver} です。インストール先を選んで{verb}してください。"
+                )),
+                wide_nul(verb),
+            )
+        }
+        None => (
+            wide_nul(&format!("LustTermina v{running_ver} をインストールしますか？")),
+            wide_nul(
+                "スタートメニューのショートカットと、右クリックの「LustTermina で開く」を追加します。",
+            ),
+            wide_nul("インストール"),
+        ),
+    };
+    // ラジオ末尾に現在版を添える。未導入は「未インストール」。
+    let ver_suffix = |v: &Option<String>| match v {
+        Some(s) => format!("現在 v{s}"),
+        None => "未インストール".to_string(),
+    };
+    let r1 = wide_nul(&format!(
+        "このユーザー専用（管理者権限は不要）／{}",
+        ver_suffix(&peruser_ver)
+    ));
+    let r2 = wide_nul(&format!(
+        "PC 全体（管理者権限が必要）／{}",
+        ver_suffix(&machine_ver)
+    ));
+    let open = wide_nul("インストールせずに開く");
     let radios = [
         TASKDIALOG_BUTTON { nButtonID: ID_PERUSER, pszButtonText: PCWSTR(r1.as_ptr()) },
         TASKDIALOG_BUTTON { nButtonID: ID_MACHINE, pszButtonText: PCWSTR(r2.as_ptr()) },
     ];
-    let buttons = [TASKDIALOG_BUTTON { nButtonID: ID_INSTALL, pszButtonText: PCWSTR(btn.as_ptr()) }];
+    let buttons = [
+        TASKDIALOG_BUTTON { nButtonID: ID_INSTALL, pszButtonText: PCWSTR(btn.as_ptr()) },
+        TASKDIALOG_BUTTON { nButtonID: ID_OPEN, pszButtonText: PCWSTR(open.as_ptr()) },
+    ];
     let mut cfg: TASKDIALOGCONFIG = unsafe { std::mem::zeroed() };
     cfg.cbSize = std::mem::size_of::<TASKDIALOGCONFIG>() as u32;
     cfg.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION;
     cfg.dwCommonButtons = TDCBF_CANCEL_BUTTON;
+    cfg.cxWidth = 200; // 幅を明示してラジオのラベル折り返しを防ぐ（0=自動だと狭くて wrap する）
     cfg.pszWindowTitle = PCWSTR(title.as_ptr());
     cfg.pszMainInstruction = PCWSTR(main.as_ptr());
     cfg.pszContent = PCWSTR(content.as_ptr());
@@ -4316,19 +4456,28 @@ fn ask_install_scope() -> Option<InstallScope> {
     cfg.nDefaultButton = ID_INSTALL;
     cfg.cRadioButtons = radios.len() as u32;
     cfg.pRadioButtons = radios.as_ptr();
-    cfg.nDefaultRadioButton = ID_PERUSER; // 既定は自分専用（UAC 不要側）
+    // 既定のラジオ：既に導入先があればそこ、無ければ自分専用（UAC 不要側）。
+    cfg.nDefaultRadioButton = if existing == Some(InstallScope::Machine) {
+        ID_MACHINE
+    } else {
+        ID_PERUSER
+    };
     let mut pressed = 0i32;
     let mut radio = 0i32;
     let ok =
         unsafe { TaskDialogIndirect(&cfg, Some(&mut pressed), Some(&mut radio), None).is_ok() };
-    if !ok || pressed != ID_INSTALL {
-        return None; // キャンセル
+    if !ok {
+        return InstallChoice::Cancel;
     }
-    Some(if radio == ID_MACHINE {
-        InstallScope::Machine
-    } else {
-        InstallScope::PerUser
-    })
+    match pressed {
+        ID_INSTALL => InstallChoice::Install(if radio == ID_MACHINE {
+            InstallScope::Machine
+        } else {
+            InstallScope::PerUser
+        }),
+        ID_OPEN => InstallChoice::OpenPortable,
+        _ => InstallChoice::Cancel, // キャンセル / ×閉じ / Esc
+    }
 }
 
 // 本体終了後にインストールフォルダをまるごと削除する（自己削除）。窓は出さない。
@@ -4395,8 +4544,9 @@ fn main() -> eframe::Result {
     match &launch {
         Launch::Install => {
             // インストール先（このユーザー／PC全体）をラジオで選ばせて実行。
-            let Some(scope) = ask_install_scope() else {
-                return Ok(()); // キャンセル
+            // 明示的な導入コマンドなので、「導入」以外（キャンセル／インストールせずに開く）は何もせず終了。
+            let InstallChoice::Install(scope) = ask_install_scope() else {
+                return Ok(());
             };
             let ok = perform_install(scope);
             msg_box(
@@ -4457,16 +4607,27 @@ fn main() -> eframe::Result {
             }
         }
         Launch::Normal => {
-            // インストール先以外から起動され、まだ未インストールなら導入を促す（初回のぽちぽち）。
-            if !running_from_install() && installed_scope().is_none() {
-                if let Some(scope) = ask_install_scope() {
-                    if perform_install(scope) {
-                        // 以後は本体＝インストール版にしたいので、そちらを起動して自分は終了。
-                        if let Some(exe) = installed_exe(scope) {
-                            let _ = std::process::Command::new(exe).spawn();
+            // インストール先以外（＝ダウンロードした配布 exe 等）から起動されたら、まず
+            // インストール画面を出す。未インストールなら新規、既にあれば更新／再インストールの
+            // 文面になり、どちらの場合もインストール先（このユーザー／PC全体）を選べる。
+            // 「インストールせずに開く」を選んだ時だけ、このままポータブル起動する。
+            // 「キャンセル」は何もせず終了（起動もしない）＝直感通り。
+            // ※ 開発ビルド（target/debug 等）では毎回ダイアログが出ると煩わしいので出さない。
+            //   配布物は release ビルドなので実配布では常に出る。
+            if !running_from_install() && !cfg!(debug_assertions) {
+                match ask_install_scope() {
+                    InstallChoice::Install(scope) => {
+                        if perform_install(scope) {
+                            // 以後は本体＝インストール版にしたいので、そちらを起動して自分は終了。
+                            if let Some(exe) = installed_exe(scope) {
+                                let _ = std::process::Command::new(exe).spawn();
+                            }
+                            return Ok(());
                         }
-                        return Ok(());
+                        // 導入に失敗したら、フォールバックでこのまま起動する（下へ流す）。
                     }
+                    InstallChoice::OpenPortable => {} // このまま起動：下へ流す
+                    InstallChoice::Cancel => return Ok(()), // 何もせず終了
                 }
             }
         }
