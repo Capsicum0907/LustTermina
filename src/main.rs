@@ -910,6 +910,18 @@ impl Session {
         use egui::{Event, ImeEvent, Key};
         let events = ctx.input(|i| i.events.clone());
         let mut sent = false;
+        // 端末モードを一度だけ読む（ロックはすぐ手放す。ループ中保持するとリーダースレッドの
+        // パースを止めてしまう）。貼り付けの囲み・矢印のアプリカーソルキーモードに使う。
+        let (bracketed_paste, app_cursor) = match self.term.lock() {
+            Ok(term) => {
+                let m = *term.mode();
+                (
+                    m.contains(TermMode::BRACKETED_PASTE),
+                    m.contains(TermMode::APP_CURSOR),
+                )
+            }
+            Err(_) => (false, false),
+        };
         for ev in events {
             match ev {
                 // 修飾なしの可読文字（英数記号）はここで来る
@@ -930,9 +942,20 @@ impl Session {
                     self.preedit.clear();
                     sent = true;
                 }
-                // ペースト（Ctrl+V は Key ではなくこのイベントで届く）。改行は CR に
+                // ペースト（Ctrl+V は Key ではなくこのイベントで届く）。改行は CR に統一。
+                // アプリがブラケットペーストを有効化(\x1b[?2004h)していれば \x1b[200~ … \x1b[201~
+                // で囲む。claude 等はこれで「複数行の貼り付け」と「送信」を区別する。囲む場合は
+                // 中身の終端マーカーを除去して、貼り付け文字列でモードを抜けさせる注入を防ぐ。
                 Event::Paste(t) => {
-                    self.send(t.replace('\n', "\r").as_bytes());
+                    let body = t.replace("\r\n", "\r").replace('\n', "\r");
+                    if bracketed_paste {
+                        let safe = body.replace("\x1b[201~", "");
+                        self.send(b"\x1b[200~");
+                        self.send(safe.as_bytes());
+                        self.send(b"\x1b[201~");
+                    } else {
+                        self.send(body.as_bytes());
+                    }
                     sent = true;
                 }
                 // Ctrl+C は egui-winit が Copy に化ける。選択があればクリップボードへコピー、
@@ -965,8 +988,15 @@ impl Session {
                     modifiers,
                     ..
                 } => {
-                    // Ctrl+Tab はタブ循環（アプリ側で処理）。pty には送らない
+                    // Ctrl+Tab / Ctrl+Shift+Tab はタブ循環（アプリ側で処理）。pty には送らない
                     if modifiers.ctrl && key == Key::Tab {
+                        continue;
+                    }
+                    // Shift+Tab（Ctrl なし）→ back-tab \x1b[Z（CBT）。claude の権限モード循環など、
+                    // 逆送りショートカットはこれを見ている。素の Tab(\t) に化ける前に横取りする。
+                    if modifiers.shift && !modifiers.ctrl && key == Key::Tab {
+                        self.send(b"\x1b[Z");
+                        sent = true;
                         continue;
                     }
                     // Ctrl+Backspace → 直前の単語を空白まで一括削除。
@@ -985,24 +1015,26 @@ impl Session {
                             continue;
                         }
                     }
-                    let seq: &[u8] = match key {
-                        Key::Enter => b"\r",
-                        Key::Backspace => b"\x7f",
-                        Key::Tab => b"\t",
-                        Key::Escape => b"\x1b",
-                        Key::ArrowUp => b"\x1b[A",
-                        Key::ArrowDown => b"\x1b[B",
-                        Key::ArrowRight => b"\x1b[C",
-                        Key::ArrowLeft => b"\x1b[D",
-                        Key::Home => b"\x1b[H",
-                        Key::End => b"\x1b[F",
-                        Key::Delete => b"\x1b[3~",
-                        Key::PageUp => b"\x1b[5~",
-                        Key::PageDown => b"\x1b[6~",
-                        _ => b"",
-                    };
+                    // Alt + 英字（Ctrl なし）→ Meta。ESC を前置して文字を送る（\x1b + 文字）。
+                    // Shift 併用時は大文字。egui は Alt 併用の可読文字を Text で流さないので、
+                    // ここで拾わないと Alt 系バインドが丸ごと死ぬ。
+                    if modifiers.alt && !modifiers.ctrl {
+                        if let Some(lower) = ctrl_letter(key) {
+                            let ch = if modifiers.shift {
+                                lower.to_ascii_uppercase()
+                            } else {
+                                lower
+                            };
+                            self.send(&[0x1b, ch]);
+                            sent = true;
+                            continue;
+                        }
+                    }
+                    // 残り（矢印・Home/End・編集キー・Enter/Tab/Backspace/Escape）は
+                    // モード（アプリカーソルキー）と修飾（Ctrl/Shift/Alt）を織り込んで符号化する。
+                    let seq = encode_key(key, &modifiers, app_cursor);
                     if !seq.is_empty() {
-                        self.send(seq);
+                        self.send(&seq);
                         sent = true;
                     }
                 }
@@ -1421,6 +1453,67 @@ fn ctrl_letter(key: egui::Key) -> Option<u8> {
         _ => return None,
     };
     Some(c)
+}
+
+// xterm 方式の修飾パラメータ。Shift=1, Alt=2, Ctrl=4 のビット和に 1 を足す
+// （例: Ctrl=5, Shift=2, Ctrl+Shift=6）。修飾なしは None。
+fn csi_mod(m: &egui::Modifiers) -> Option<u8> {
+    let mut bits = 0u8;
+    if m.shift {
+        bits |= 1;
+    }
+    if m.alt {
+        bits |= 2;
+    }
+    if m.ctrl {
+        bits |= 4;
+    }
+    if bits == 0 {
+        None
+    } else {
+        Some(bits + 1)
+    }
+}
+
+// 矢印・編集キー等を、アプリカーソルキーモードと修飾を織り込んで符号化する。
+// - カーソル/Home/End: 修飾ありは CSI 1;m<終端>、修飾なしはアプリモードで SS3(\x1bO)、
+//   通常モードで CSI(\x1b[)。
+// - チルダ系(Delete/PageUp/PageDown/Insert): CSI n~ / 修飾ありは CSI n;m~。
+// 該当なしは空 Vec（＝送らない）。
+fn encode_key(key: egui::Key, m: &egui::Modifiers, app_cursor: bool) -> Vec<u8> {
+    use egui::Key;
+    let modc = csi_mod(m);
+    let cursor = |fin: u8| -> Vec<u8> {
+        match modc {
+            Some(code) => format!("\x1b[1;{code}{}", fin as char).into_bytes(),
+            None if app_cursor => vec![0x1b, b'O', fin],
+            None => vec![0x1b, b'[', fin],
+        }
+    };
+    let tilde = |n: u8| -> Vec<u8> {
+        match modc {
+            Some(code) => format!("\x1b[{n};{code}~").into_bytes(),
+            None => format!("\x1b[{n}~").into_bytes(),
+        }
+    };
+    match key {
+        Key::ArrowUp => cursor(b'A'),
+        Key::ArrowDown => cursor(b'B'),
+        Key::ArrowRight => cursor(b'C'),
+        Key::ArrowLeft => cursor(b'D'),
+        Key::Home => cursor(b'H'),
+        Key::End => cursor(b'F'),
+        Key::Insert => tilde(2),
+        Key::Delete => tilde(3),
+        Key::PageUp => tilde(5),
+        Key::PageDown => tilde(6),
+        // 基本キーは従来どおり（修飾での区別はレガシー・エンコードでは表現できない）。
+        Key::Enter => b"\r".to_vec(),
+        Key::Backspace => b"\x7f".to_vec(),
+        Key::Tab => b"\t".to_vec(),
+        Key::Escape => b"\x1b".to_vec(),
+        _ => Vec::new(),
+    }
 }
 
 // ---- ドラッグ中のタブ（D&D 並べ替え）----
