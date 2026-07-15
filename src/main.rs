@@ -5694,6 +5694,41 @@ lust_termina.exe [オプション]
 補足: --tab で開いたタブには環境変数 LUSTTERMINA_TAB_DEPTH に
 「何代目か」が入ります（直接開いたタブ=無し、子=1, 孫=2, …）。";
 
+// 親プロセスのコンソールへ HELP_TEXT を書く。成功したら true、親にコンソールが
+// 無ければ false（呼び元がダイアログにフォールバックする）。GUI サブシステムなので
+// println! はどこにも届かない：AttachConsole(親) → CONOUT$ に UTF-16 で直書きする。
+// ヘルプを見ながらそのまま次のコマンドを打てるように、シェル内に出すのが本命。
+fn print_help_to_parent_console() -> bool {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, GENERIC_WRITE};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows::Win32::System::Console::{AttachConsole, WriteConsoleW, ATTACH_PARENT_PROCESS};
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS).is_err() {
+            return false; // 親にコンソールが無い（ダブルクリック起動等）
+        }
+        let name = wide_nul("CONOUT$");
+        let Ok(handle) = CreateFileW(
+            PCWSTR(name.as_ptr()),
+            GENERIC_WRITE.0,
+            FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            None,
+        ) else {
+            return false;
+        };
+        let text: Vec<u16> = format!("\r\n{HELP_TEXT}\r\n").encode_utf16().collect();
+        let mut written = 0u32;
+        let ok = WriteConsoleW(handle, &text, Some(&mut written), None).is_ok();
+        let _ = CloseHandle(handle);
+        ok
+    }
+}
+
 // 引数列（プログラム名は除いたもの）を解釈して起動意図を返す。
 fn parse_launch<I: Iterator<Item = String>>(mut args: I) -> Launch {
     while let Some(a) = args.next() {
@@ -5816,7 +5851,11 @@ fn main() -> eframe::Result {
             std::process::exit(if uninstall_context_menu(HKEY_CURRENT_USER) { 0 } else { 1 });
         }
         Launch::Help => {
-            msg_box(HELP_TEXT, "LustTermina", MB_ICONINFORMATION);
+            // シェルから呼ばれたらそのコンソール内に出す（ヘルプを見ながら打てるように）。
+            // コンソールが無い起動（ダブルクリック等）だけダイアログにフォールバック。
+            if !print_help_to_parent_console() {
+                msg_box(HELP_TEXT, "LustTermina", MB_ICONINFORMATION);
+            }
             return Ok(());
         }
         // Explorer の「このディレクトリで開く」等で2つ目以降が起動されたら、既存インスタンスへ
