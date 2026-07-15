@@ -756,6 +756,17 @@ struct Session {
 
 impl Session {
     fn spawn(ctx: &egui::Context, title: String, spec: &ShellSpec, cwd: &str) -> Self {
+        Self::spawn_with_env(ctx, title, spec, cwd, &[])
+    }
+
+    // 追加の環境変数付きでタブを開く版。--tab の系譜スタンプ（LUSTTERMINA_TAB_DEPTH）用。
+    fn spawn_with_env(
+        ctx: &egui::Context,
+        title: String,
+        spec: &ShellSpec,
+        cwd: &str,
+        extra_env: &[(String, String)],
+    ) -> Self {
         let init = TermSize { cols: 80, rows: 24 };
 
         // PTY を開いて pwsh を起動
@@ -772,6 +783,9 @@ impl Session {
         // シェルの起動定義（プログラム＋引数）は ShellSpec が持つ（探索結果）。
         let mut cmd = CommandBuilder::new(&spec.program);
         cmd.args(&spec.args);
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
         if !cwd.is_empty() {
             cmd.cwd(cwd);
         }
@@ -1901,6 +1915,33 @@ impl App {
                 default_bg,
                 default_accent,
             ));
+        } else if let Launch::Tab { spec, .. } = &launch {
+            // --tab（本体不在 or --new-window）：そのタブ1枚だけ開く（起動タブ定義は無視）。
+            // 深度スタンプは「呼び出し元+1」。この新プロセス自体が呼び出し元の子なので、
+            // 環境変数は呼び出し元の値を継承している。
+            let si = shells
+                .iter()
+                .position(|s| s.short == spec.shell)
+                .unwrap_or(default_shell);
+            let cwd = if spec.cwd.is_empty() {
+                default_cwd.clone()
+            } else {
+                spec.cwd.clone()
+            };
+            let name = if spec.name.is_empty() {
+                format!("{} 1", shells[si].short)
+            } else {
+                spec.name.clone()
+            };
+            let env = [(
+                TAB_DEPTH_ENV.to_string(),
+                (current_tab_depth() + 1).to_string(),
+            )];
+            let mut s = Session::spawn_with_env(&cc.egui_ctx, name, &shells[si], &cwd, &env);
+            s.bg = color_from_hex(&spec.bg).unwrap_or(default_bg);
+            s.accent = color_from_hex(&spec.accent).unwrap_or(default_accent);
+            s.send_commands_paced(spec.commands.clone(), startup_quiet_ms, startup_max_wait_ms);
+            sessions.push(s);
         } else if startup.is_empty() {
             let mut s = Session::spawn(
                 &cc.egui_ctx,
@@ -2117,6 +2158,16 @@ impl App {
     // プリセット（型）から新しいタブを実体化して開く。起動時と同じ解決規則で、
     // 未指定フィールドは既定にフォールバック。コマンドは編集中バッファを正とする。
     fn spawn_tab_from_spec(&mut self, ctx: &egui::Context, spec: &TabSpec) {
+        self.spawn_tab_from_spec_env(ctx, spec, &[]);
+    }
+
+    // 追加環境変数付き版（--tab の系譜スタンプ用。UI からのプリセット実体化は env なし）。
+    fn spawn_tab_from_spec_env(
+        &mut self,
+        ctx: &egui::Context,
+        spec: &TabSpec,
+        extra_env: &[(String, String)],
+    ) {
         let si = self
             .shells
             .iter()
@@ -2134,7 +2185,7 @@ impl App {
         } else {
             spec.name.clone()
         };
-        let mut sess = Session::spawn(ctx, name, &self.shells[si], &cwd);
+        let mut sess = Session::spawn_with_env(ctx, name, &self.shells[si], &cwd, extra_env);
         sess.bg = color_from_hex(&spec.bg).unwrap_or(self.default_bg);
         sess.accent = color_from_hex(&spec.accent).unwrap_or(self.default_accent);
         sess.send_commands_paced(
@@ -2144,6 +2195,19 @@ impl App {
         );
         self.sessions.push(sess);
         self.active = self.sessions.len() - 1;
+    }
+
+    // --tab（パイプ経由）のタブ生成。不明シェルは既定に落とすが、黙らず toast で可視化する。
+    fn open_requested_tab(&mut self, ctx: &egui::Context, mut req: TabRequest) {
+        req.tab.sync_buf_from_commands();
+        if !req.tab.shell.is_empty() && !self.shells.iter().any(|s| s.short == req.tab.shell) {
+            self.show_toast(format!(
+                "シェル「{}」が見つからないため既定シェルで開きます",
+                req.tab.shell
+            ));
+        }
+        let env = [(TAB_DEPTH_ENV.to_string(), req.depth.to_string())];
+        self.spawn_tab_from_spec_env(ctx, &req.tab, &env);
     }
 
     // 設定ページ（端末の代わりに中央へ全面表示）。閉じる時に TOML 保存。
@@ -3893,6 +3957,7 @@ impl eframe::App for App {
                 match m {
                     IpcMsg::OpenDir(d) => self.open_dir_tab(&ctx, &d),
                     IpcMsg::RunScript(p) => self.open_script_tab(&ctx, &p),
+                    IpcMsg::OpenTab(req) => self.open_requested_tab(&ctx, req),
                 }
             }
         }
@@ -4433,11 +4498,34 @@ impl eframe::App for App {
 // メッセージ書式は <verb>\t<payload>。cwd＝フォルダで開く、run＝スクリプトを実行。
 const IPC_VERB_CWD: &str = "cwd";
 const IPC_VERB_RUN: &str = "run";
+const IPC_VERB_TAB: &str = "tab";
 
 // 既存インスタンスへ転送する要求。UI スレッドで対応するタブを開く。
 enum IpcMsg {
     OpenDir(String),  // フォルダを既定シェルのタブで開く
     RunScript(String), // スクリプトを実行するタブを開く
+    OpenTab(TabRequest), // --tab：仕様どおりのタブを1枚開く
+}
+
+// --tab のタブ生成要求。パイプでは TOML に畳んで運ぶ（新規依存なし・タブ/改行入り文字列も安全）。
+// depth は「何代目のタブか」の系譜スタンプ。生成されるタブの環境変数
+// LUSTTERMINA_TAB_DEPTH に入り、タブ内から自分の深度が分かる（連鎖の可視化）。
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct TabRequest {
+    #[serde(default)]
+    tab: TabSpec,
+    #[serde(default)]
+    depth: u32,
+}
+
+const TAB_DEPTH_ENV: &str = "LUSTTERMINA_TAB_DEPTH";
+
+// 呼び出し元プロセス自身の深度（スタンプ無し＝根本＝0）。
+fn current_tab_depth() -> u32 {
+    std::env::var(TAB_DEPTH_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
 }
 
 // パイプ名。別ユーザーと衝突しないようユーザー名で分ける（per-user）。
@@ -4534,6 +4622,20 @@ fn ipc_start_server(ctx: &egui::Context) -> Option<mpsc::Receiver<IpcMsg>> {
                     (!p.is_empty()).then(|| IpcMsg::OpenDir(p.to_string()))
                 } else if let Some(p) = s.strip_prefix(&format!("{IPC_VERB_RUN}\t")) {
                     (!p.is_empty()).then(|| IpcMsg::RunScript(p.to_string()))
+                } else if let Some(p) = s.strip_prefix(&format!("{IPC_VERB_TAB}\t")) {
+                    // 動詞との区切りは最初のタブ1個だけ。本文（TOML）内のタブ・改行は
+                    // TOML のエスケープが復元するので衝突しない。壊れた要求も黙って
+                    // 捨てず、マーカー付きタブとして可視化する（silent fail 回避）。
+                    Some(match toml::from_str::<TabRequest>(p) {
+                        Ok(req) => IpcMsg::OpenTab(req),
+                        Err(_) => IpcMsg::OpenTab(TabRequest {
+                            tab: TabSpec {
+                                name: format!("{UNRESOLVED_PRESET_MARK} 不正なタブ要求"),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }),
+                    })
                 } else {
                     None
                 };
@@ -5144,6 +5246,178 @@ fn write_uninstall_entry(
 
 // 指定スコープへ実際に配置・登録する（PC全体スコープなら管理者権限で呼ばれている前提）。
 // 旧版が実行中でロックされていてもリネームで避けて置き換える。
+// ---- PATH 登録（インストール先をユーザー/システムの Path に追記・除去）----
+// PerUser は HKCU\Environment、Machine は HKLM のシステム環境キー（昇格済みで呼ばれる前提）。
+// Path は REG_EXPAND_SZ（%SystemRoot% 等の変数を含む）なので、既存 reg_get_sz/reg_set_sz
+// （REG_SZ 専用）は使わず、生読み（NOEXPAND）と EXPAND_SZ 書き込みの専用ヘルパで扱う。
+// 変更後は WM_SETTINGCHANGE("Environment") を放送（既存シェルは再起動まで反映されない）。
+
+// PATH 経由で使う短い別名（シム .cmd の名前）。exe 名は変えず、ここ一箇所で決める。
+// lt は他ツールと被りやすいので 3 文字（本人指定 2026-07-15）。
+const CLI_ALIAS: &str = "ltm";
+
+fn env_reg_key(scope: InstallScope) -> (windows::Win32::System::Registry::HKEY, &'static str) {
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    match scope {
+        InstallScope::PerUser => (HKEY_CURRENT_USER, "Environment"),
+        InstallScope::Machine => (
+            HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+        ),
+    }
+}
+
+// Path 値を「変数を展開せず」に読む（REG_SZ / REG_EXPAND_SZ 両対応）。
+fn reg_get_path_raw(
+    root: windows::Win32::System::Registry::HKEY,
+    subkey: &str,
+) -> Option<String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{
+        RegGetValueW, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
+    };
+    let subkey_w = wide_nul(subkey);
+    let name_w = wide_nul("Path");
+    let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND;
+    unsafe {
+        let mut size: u32 = 0;
+        let rc = RegGetValueW(
+            root,
+            PCWSTR(subkey_w.as_ptr()),
+            PCWSTR(name_w.as_ptr()),
+            flags,
+            None,
+            None,
+            Some(&mut size),
+        );
+        if rc != ERROR_SUCCESS || size < 2 {
+            return None;
+        }
+        let mut buf = vec![0u8; size as usize];
+        let rc2 = RegGetValueW(
+            root,
+            PCWSTR(subkey_w.as_ptr()),
+            PCWSTR(name_w.as_ptr()),
+            flags,
+            None,
+            Some(buf.as_mut_ptr() as *mut _),
+            Some(&mut size),
+        );
+        if rc2 != ERROR_SUCCESS {
+            return None;
+        }
+        let s: Vec<u16> = buf[..(size as usize)]
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .take_while(|&c| c != 0)
+            .collect();
+        Some(String::from_utf16_lossy(&s))
+    }
+}
+
+// Path 値を REG_EXPAND_SZ で書く（%VAR% 入りエントリを壊さない型）。
+fn reg_set_path_raw(
+    root: windows::Win32::System::Registry::HKEY,
+    subkey: &str,
+    value: &str,
+) -> bool {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, KEY_WRITE, REG_EXPAND_SZ,
+        REG_OPTION_NON_VOLATILE,
+    };
+    let subkey_w = wide_nul(subkey);
+    let name_w = wide_nul("Path");
+    let data: Vec<u8> = value
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    unsafe {
+        let mut hkey = HKEY::default();
+        let rc = RegCreateKeyExW(
+            root,
+            PCWSTR(subkey_w.as_ptr()),
+            None,
+            PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            None,
+            &mut hkey,
+            None,
+        );
+        if rc != ERROR_SUCCESS {
+            return false;
+        }
+        let rc2 = RegSetValueExW(hkey, PCWSTR(name_w.as_ptr()), None, REG_EXPAND_SZ, Some(&data));
+        let _ = RegCloseKey(hkey);
+        rc2 == ERROR_SUCCESS
+    }
+}
+
+// 環境変数の変更をシステムに知らせる（新しく開くシェルから有効になる）。
+fn broadcast_env_change() {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE,
+    };
+    let env = wide_nul("Environment");
+    unsafe {
+        let _ = SendMessageTimeoutW(
+            HWND_BROADCAST,
+            WM_SETTINGCHANGE,
+            windows::Win32::Foundation::WPARAM(0),
+            windows::Win32::Foundation::LPARAM(env.as_ptr() as isize),
+            SMTO_ABORTIFHUNG,
+            3000,
+            None,
+        );
+    }
+}
+
+// インストール先を Path に追記（既にあれば何もしない。比較は大小無視・空白無視）。
+fn add_to_path(scope: InstallScope, dir: &str) -> bool {
+    let (root, key) = env_reg_key(scope);
+    let cur = reg_get_path_raw(root, key).unwrap_or_default();
+    if cur
+        .split(';')
+        .any(|p| p.trim().eq_ignore_ascii_case(dir))
+    {
+        return true; // 登録済み
+    }
+    let new = if cur.trim().is_empty() {
+        dir.to_string()
+    } else {
+        format!("{};{}", cur.trim_end_matches(';'), dir)
+    };
+    let ok = reg_set_path_raw(root, key, &new);
+    if ok {
+        broadcast_env_change();
+    }
+    ok
+}
+
+// インストール先を Path から除去（無ければ成功扱い）。
+fn remove_from_path(scope: InstallScope, dir: &str) -> bool {
+    let (root, key) = env_reg_key(scope);
+    let Some(cur) = reg_get_path_raw(root, key) else {
+        return true;
+    };
+    if !cur.split(';').any(|p| p.trim().eq_ignore_ascii_case(dir)) {
+        return true;
+    }
+    let parts: Vec<&str> = cur
+        .split(';')
+        .filter(|p| !p.trim().is_empty() && !p.trim().eq_ignore_ascii_case(dir))
+        .collect();
+    let ok = reg_set_path_raw(root, key, &parts.join(";"));
+    if ok {
+        broadcast_env_change();
+    }
+    ok
+}
+
 fn do_install(scope: InstallScope) -> bool {
     let (Some(dir), Some(dst)) = (install_dir(scope), installed_exe(scope)) else {
         return false;
@@ -5187,6 +5461,13 @@ fn do_install(scope: InstallScope) -> bool {
     );
     install_context_menu(root, &exe);
     write_uninstall_entry(root, &exe, &dir_s);
+    // PATH 登録＋短い別名シム（`lt` で本体に委譲する 1 行の cmd）。
+    // シムはインストールフォルダ内なのでアンインストール時はフォルダ削除に含まれる。
+    add_to_path(scope, &dir_s);
+    let _ = std::fs::write(
+        dir.join(format!("{CLI_ALIAS}.cmd")),
+        "@\"%~dp0lust_termina.exe\" %*\r\n",
+    );
     true
 }
 
@@ -5207,6 +5488,7 @@ fn do_uninstall(scope: InstallScope, delete_config: bool) -> bool {
     // 実行中の自分自身（インストール先 exe）はロックされていて消せないので、本体終了を
     // 少し待ってからフォルダごと削除する小さな外部プロセスを投げておく。
     if let Some(dir) = install_dir(scope) {
+        remove_from_path(scope, &dir.to_string_lossy());
         schedule_dir_deletion(&dir.to_string_lossy());
     }
     true
@@ -5372,13 +5654,45 @@ enum Launch {
     Normal,                    // 通常起動：起動タブ定義に従う（未インストールなら導入を促す）
     Cwd(String),               // --cwd <path>：そのフォルダでタブ1枚（起動タブ定義は無視）
     RunScript(String),         // --run <path>：スクリプトをそのフォルダで実行するタブ1枚
+    // --tab [--cwd <dir>] [--shell <short>] [--name <名>] [--cmd <行>]... [--new-window]
+    // 仕様どおりのタブを既存インスタンスへ合流（本体不在 or --new-window なら自分が窓になる）。
+    Tab { spec: TabSpec, new_window: bool },
     Install,                   // --install：インストール（先を選ばせて）実行し終了
     Uninstall,                 // --uninstall：アンインストールして終了
     DoInstallMachine,          // --do-install-machine：PC全体へ配置（昇格済みの代行ワーカ）
     DoUninstallMachine(bool),  // --do-uninstall-machine <0|1>：PC全体を削除（昇格済みの代行ワーカ）
     InstallContextMenu,        // --install-context-menu：右クリックのみ登録して終了
     UninstallContextMenu,      // --uninstall-context-menu：右クリックのみ解除して終了
+    Help,                      // --help / -h / /?：使い方を表示して終了
 }
+
+// --help の本文。GUI サブシステム（コンソール無し）なので stdout ではなくダイアログで出す。
+const HELP_TEXT: &str = "\
+LustTermina — コマンドライン引数
+
+lust_termina.exe [オプション]
+
+タブを開く:
+  --tab                 タブを1枚開く（起動済みの窓があればそこへ合流）
+    --cwd <dir>           作業フォルダ
+    --shell <short>       シェル（pwsh / powershell / cmd など。省略時は既定）
+    --name <名前>         タブ名
+    --cmd <コマンド行>    起動後に投入するコマンド（複数回指定可・順に実行）
+    --new-window          合流せず新しい窓で開く
+  --cwd <dir>           そのフォルダで開く（Explorer 連携と同じ）
+  --run <script>        スクリプトをそのフォルダで実行
+
+例:
+  ltm --tab --cwd \"C:\\work\\proj\" --name proj --cmd \"claude\"
+
+インストール先は PATH に登録され、短い別名 ltm（ltm.cmd）でも呼べます。
+
+セットアップ:
+  --install / --uninstall
+  --install-context-menu / --uninstall-context-menu
+
+補足: --tab で開いたタブには環境変数 LUSTTERMINA_TAB_DEPTH に
+「何代目か」が入ります（直接開いたタブ=無し、子=1, 孫=2, …）。";
 
 // 引数列（プログラム名は除いたもの）を解釈して起動意図を返す。
 fn parse_launch<I: Iterator<Item = String>>(mut args: I) -> Launch {
@@ -5394,6 +5708,40 @@ fn parse_launch<I: Iterator<Item = String>>(mut args: I) -> Launch {
                     return Launch::RunScript(p);
                 }
             }
+            "--tab" => {
+                // 以降の引数を全部タブ仕様として消費する。--cmd の値は「直後の1引数を
+                // 丸ごと1行のコマンド」として受け取り、中身は一切解釈しない（引用の
+                // 消費は各境界で1回ずつ＝入れ子でも破綻しない）。--cmd は複数回可。
+                let mut spec = TabSpec::default();
+                let mut new_window = false;
+                while let Some(f) = args.next() {
+                    match f.as_str() {
+                        "--cwd" => {
+                            if let Some(v) = args.next() {
+                                spec.cwd = v;
+                            }
+                        }
+                        "--shell" => {
+                            if let Some(v) = args.next() {
+                                spec.shell = v;
+                            }
+                        }
+                        "--name" => {
+                            if let Some(v) = args.next() {
+                                spec.name = v;
+                            }
+                        }
+                        "--cmd" => {
+                            if let Some(v) = args.next() {
+                                spec.commands.push(v);
+                            }
+                        }
+                        "--new-window" => new_window = true,
+                        _ => {}
+                    }
+                }
+                return Launch::Tab { spec, new_window };
+            }
             "--install" => return Launch::Install,
             "--uninstall" => return Launch::Uninstall,
             "--do-install-machine" => return Launch::DoInstallMachine,
@@ -5403,6 +5751,7 @@ fn parse_launch<I: Iterator<Item = String>>(mut args: I) -> Launch {
             }
             "--install-context-menu" => return Launch::InstallContextMenu,
             "--uninstall-context-menu" => return Launch::UninstallContextMenu,
+            "--help" | "-h" | "/?" => return Launch::Help,
             _ => {}
         }
     }
@@ -5466,6 +5815,10 @@ fn main() -> eframe::Result {
         Launch::UninstallContextMenu => {
             std::process::exit(if uninstall_context_menu(HKEY_CURRENT_USER) { 0 } else { 1 });
         }
+        Launch::Help => {
+            msg_box(HELP_TEXT, "LustTermina", MB_ICONINFORMATION);
+            return Ok(());
+        }
         // Explorer の「このディレクトリで開く」等で2つ目以降が起動されたら、既存インスタンスへ
         // 転送して自分は窓を出さずに終了する。転送先が居なければ通常起動（自分が本体になる）。
         Launch::Cwd(path) => {
@@ -5478,6 +5831,22 @@ fn main() -> eframe::Result {
             if ipc_try_forward(IPC_VERB_RUN, path) {
                 return Ok(());
             }
+        }
+        // --tab：本体が居れば TOML に畳んで合流。--new-window は転送せず自分が窓になる。
+        // depth は呼び出し元の深度+1（環境変数から。根本＝0 → 子＝1）。
+        Launch::Tab { spec, new_window } => {
+            if !*new_window {
+                let req = TabRequest {
+                    tab: spec.clone(),
+                    depth: current_tab_depth() + 1,
+                };
+                if let Ok(payload) = toml::to_string(&req) {
+                    if ipc_try_forward(IPC_VERB_TAB, &payload) {
+                        return Ok(());
+                    }
+                }
+            }
+            // 本体不在 or --new-window：下へ流して自分が窓になる（App::new が Tab を開く）。
         }
         Launch::Normal => {
             // インストール先以外（＝ダウンロードした配布 exe 等）から起動されたら、まず
