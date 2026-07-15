@@ -1817,6 +1817,9 @@ struct App {
     toast: Option<(String, std::time::Instant)>, // 一時通知（保存しました 等）
     // 別インスタンスから転送された「このフォルダで開く」要求の受信口（本体のみ Some）。
     ipc_rx: Option<mpsc::Receiver<IpcMsg>>,
+    // 枠（タイトルバー）ダークの再適用管理（詳細は apply_dark_titlebar のコメント）。
+    titlebar_last_dark: Option<std::time::Instant>, // 最後に再適用した時刻
+    titlebar_was_focused: bool,                     // 前フレームのフォーカス状態
 }
 
 impl App {
@@ -2035,6 +2038,8 @@ impl App {
             toast: None,
             // 受け口の生成に成功した（＝このプロセスが本体の）ときだけ Some。
             ipc_rx: ipc_start_server(&cc.egui_ctx),
+            titlebar_last_dark: None,
+            titlebar_was_focused: false,
         }
     }
 
@@ -3945,8 +3950,24 @@ fn shell_list(
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+
+        // 枠（タイトルバー）のダークが外部要因で剥がれることがあるため、
+        // フォーカス獲得時＋一定間隔で再適用する（詳細は apply_dark_titlebar のコメント）。
+        let focused = ctx.input(|i| i.focused);
+        if (focused && !self.titlebar_was_focused)
+            || self
+                .titlebar_last_dark
+                .map_or(true, |t| t.elapsed() >= TITLEBAR_REDARK_INTERVAL)
+        {
+            apply_dark_titlebar(frame);
+            self.titlebar_last_dark = Some(std::time::Instant::now());
+        }
+        self.titlebar_was_focused = focused;
+        // 入力も PTY 出力も無い完全アイドル時はフレームが走らず、上の再適用も
+        // 動けない。次のフレームを間隔付きで予約し、放置中でも自己修復させる。
+        ctx.request_repaint_after(TITLEBAR_REDARK_INTERVAL);
 
         // 別インスタンスから転送された「このフォルダで開く」要求を取り込む。
         // 借用を切るため一旦集めてから開く（open_dir_tab が self を可変借用するため）。
@@ -5137,6 +5158,34 @@ fn relaunch_elevated(args: &str) -> bool {
         let _ = CloseHandle(h);
         code == 0
     }
+}
+
+// 枠（タイトルバー）ダークの再適用間隔＝剥がれてから戻るまでの最大待ち時間。
+const TITLEBAR_REDARK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+// タイトルバー（ネイティブ枠）をダークにする（DWMWA_USE_IMMERSIVE_DARK_MODE）。
+// この属性は DWM（コンポジタ）側がウィンドウごとに持つ状態で、システムの
+// テーマ再評価やスリープ復帰などの外部要因で既定（ライト）に戻ることがある。
+// 起動時の SetTheme 一発では剥がれたときに戻す経路がないため、これを直接
+// 叩いて張り直す（冪等・数マイクロ秒なので頻繁に呼んで害はない）。
+// 失敗しても実害は「枠が白いまま」で、次の間隔で自動再試行されるため流す。
+fn apply_dark_titlebar(frame: &eframe::Frame) {
+    use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+    use windows::core::BOOL;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
+    let Ok(handle) = frame.window_handle() else { return };
+    let RawWindowHandle::Win32(h) = handle.as_raw() else { return };
+    let hwnd = HWND(h.hwnd.get() as *mut core::ffi::c_void);
+    let dark = BOOL(1);
+    let _ = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &dark as *const BOOL as *const core::ffi::c_void,
+            std::mem::size_of::<BOOL>() as u32,
+        )
+    };
 }
 
 // MessageBox（はい/いいえ等）。UX は標準ダイアログのみで完結させ、依存を増やさない。

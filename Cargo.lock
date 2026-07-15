@@ -1844,6 +1844,7 @@ dependencies = [
  "alacritty_terminal",
  "eframe",
  "portable-pty",
+ "raw-window-handle",
  "serde",
  "toml 0.8.23",
  "windows",
