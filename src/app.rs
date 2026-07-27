@@ -1122,12 +1122,53 @@ impl eframe::App for App {
         if self.ipc_rx.is_some() {
             let msgs: Vec<IpcMsg> =
                 self.ipc_rx.as_ref().map(|rx| rx.try_iter().collect()).unwrap_or_default();
+            let forwarded = !msgs.is_empty();
             for m in msgs {
                 match m {
                     IpcMsg::OpenDir(d) => self.open_dir_tab(&ctx, &d),
                     IpcMsg::RunScript(p) => self.open_script_tab(&ctx, &p),
                     IpcMsg::OpenTab(req) => self.open_requested_tab(&ctx, req),
                 }
+            }
+            // Explorer 等から転送されてタブが生えたら、窓を前面へ出す（最小化なら復元）。
+            // winit 経由だと最小化復元が不安定なので Win32 直（bring_to_front）で行う。
+            if forwarded {
+                bring_to_front(frame);
+            }
+        }
+
+        // スクリプト実行タブ（close_on_exit）: 子プロセスの終了を監視する。
+        // 正常終了(exit 0)なら閉じる（最後の1枚ならダブルクリック完結として窓ごと閉じる）。
+        // 失敗(非0)や監視不能なら閉じずに出力を残す＝失敗を握り潰さない。
+        {
+            let mut i = 0;
+            while i < self.sessions.len() {
+                if self.sessions[i].close_on_exit {
+                    let res = self.sessions[i].child.try_wait();
+                    match res {
+                        Ok(Some(status)) => {
+                            if status.success() {
+                                if self.sessions.len() == 1 {
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                    self.sessions[i].close_on_exit = false; // 多重送信を避ける
+                                } else {
+                                    self.sessions.remove(i);
+                                    if self.active >= self.sessions.len() {
+                                        self.active = self.sessions.len().saturating_sub(1);
+                                    } else if self.active > i {
+                                        self.active -= 1;
+                                    }
+                                    continue; // 詰めたので同じ i を再検査
+                                }
+                            } else {
+                                self.sessions[i].close_on_exit = false; // 失敗＝出力を残す
+                            }
+                        }
+                        Ok(None) => {}                                    // まだ実行中
+                        Err(_) => self.sessions[i].close_on_exit = false, // 監視不能なら諦める
+                    }
+                }
+                i += 1;
             }
         }
 

@@ -99,7 +99,10 @@ pub(crate) struct Session {
     // PTY から最後に出力が来た時刻。リーダースレッドが読むたびスタンプする。
     // 起動コマンドの投入ペーサ（send_commands_paced）が「出力が静まったか」の判定に使う。
     pub(crate) last_output: Arc<Mutex<Instant>>,
-    pub(crate) _child: Box<dyn portable_pty::Child + Send + Sync>,
+    // スクリプト実行タブ用: 子プロセスが正常終了したらこのタブを自動で閉じる（run-and-close）。
+    // 通常の対話シェルは false（残す）。失敗終了(非0)時は出力を残すため閉じない（app 側で判定）。
+    pub(crate) close_on_exit: bool,
+    pub(crate) child: Box<dyn portable_pty::Child + Send + Sync>,
 }
 
 impl Session {
@@ -197,7 +200,8 @@ impl Session {
             preedit: String::new(),
             last_mouse_cell: None,
             last_output,
-            _child: child,
+            close_on_exit: false,
+            child,
         }
     }
 

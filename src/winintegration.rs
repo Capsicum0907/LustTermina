@@ -163,26 +163,37 @@ pub(crate) fn script_parent(path: &str) -> String {
 // 対応する検出シェルが無ければ script_run_shell 側で常設シェルへフォールバックする。
 pub(crate) fn default_runner_short(ext: &str) -> &'static str {
     match ext {
-        "ps1" => "pwsh", // 無ければ powershell（常設）へ
+        "ps1" => "pwsh", // 無ければ powershell（常設）へフォールバック（下記）
         "sh" => "bash",  // 将来 .sh 対応時（Git Bash）
         _ => "cmd",      // bat/cmd 等
     }
 }
 
+// 必ず在るランナー（Windows 標準で常設）。pwsh(PowerShell 7) 等の優先ランナーが未導入の
+// ときの受け皿。これが無いと解決に失敗し「スクリプトが黙って実行されない」不具合になる
+// （pwsh 未導入マシンで発生。旧: フォールバックも pwsh を探して None を返していた）。
+pub(crate) fn guaranteed_runner_short(ext: &str) -> &'static str {
+    match ext {
+        "ps1" => "powershell", // Windows PowerShell 5.1 は常設
+        _ => "cmd",            // bat/cmd 等は cmd（常設）
+    }
+}
+
 // 選んだシェル種別（short）でスクリプト path を実行する引数。種別ごとの流儀を一箇所に集約。
-// 実行後もシェルを残す（出力確認のため）。対応しない種別はパスをそのまま渡すだけ＝
-// 「対応外シェルを選んだら動かなくてもユーザーの選択」の割り切り（握り潰さず起動は試みる）。
+// 実行が終わったらシェルも終了する（-NoExit/`/k` を付けない）＝ダブルクリック実行を完結させる。
+// タブ側は close_on_exit で正常終了なら自動クローズ／失敗なら出力を残す（app 側で判定）。
+// 対応しない種別はパスをそのまま渡すだけ＝「対応外シェルを選んだら動かなくてもユーザーの
+// 選択」の割り切り（握り潰さず起動は試みる）。
 pub(crate) fn script_run_args(short: &str, path: &str) -> Vec<String> {
     match short {
         "pwsh" | "powershell" | "devps" => vec![
-            "-NoExit".into(),
             "-ExecutionPolicy".into(),
             "Bypass".into(),
             "-File".into(),
             path.to_string(),
         ],
-        "cmd" | "devcmd" => vec!["/k".into(), path.to_string()],
-        "bash" | "wsl" => vec!["-c".into(), format!("'{path}'; exec bash")],
+        "cmd" | "devcmd" => vec!["/c".into(), path.to_string()],
+        "bash" | "wsl" => vec!["-c".into(), format!("'{path}'")],
         _ => vec![path.to_string()],
     }
 }
@@ -214,12 +225,15 @@ pub(crate) fn script_run_shell(
     if !SCRIPT_EXTS.iter().any(|e| e.trim_start_matches('.') == ext) {
         return None;
     }
-    // 選択（config）→ 組込み既定 の順で short を決め、検出シェルから引く。
+    // 選択（config）→ 組込み既定（pwsh 等）→ 常設フォールバック（powershell/cmd）の3段で
+    // 引く。pwsh は未導入のことがあるので、必ず在るシェルまで落として「黙って実行されない」
+    // を防ぐ。
     let chosen = runner.get(&ext).map(String::as_str).unwrap_or_else(|| default_runner_short(&ext));
     let base = shells
         .iter()
         .find(|s| s.short == chosen)
-        .or_else(|| shells.iter().find(|s| s.short == default_runner_short(&ext)))?;
+        .or_else(|| shells.iter().find(|s| s.short == default_runner_short(&ext)))
+        .or_else(|| shells.iter().find(|s| s.short == guaranteed_runner_short(&ext)))?;
     Some(ShellSpec {
         label: base.label.clone(),
         short: base.short.clone(),
@@ -240,7 +254,11 @@ pub(crate) fn spawn_script_session(
     bg: Color32,
     accent: Color32,
 ) -> Session {
-    let spec = script_run_shell(path, runner, shells).unwrap_or_else(|| shells[default_shell].clone());
+    // 認識できたスクリプトのみ run-and-close（拡張子不明でフォルダを開くだけのフォールバックは
+    // 通常の対話シェルなので閉じない）。
+    let script = script_run_shell(path, runner, shells);
+    let close_on_exit = script.is_some();
+    let spec = script.unwrap_or_else(|| shells[default_shell].clone());
     let dir = script_parent(path);
     let title = std::path::Path::new(path)
         .file_name()
@@ -250,6 +268,7 @@ pub(crate) fn spawn_script_session(
     let mut s = Session::spawn(ctx, title, &spec, &dir);
     s.bg = bg;
     s.accent = accent;
+    s.close_on_exit = close_on_exit;
     s
 }
 
@@ -519,6 +538,27 @@ pub(crate) fn apply_dark_titlebar(frame: &eframe::Frame) {
             std::mem::size_of::<BOOL>() as u32,
         )
     };
+}
+
+// 窓を前面へ出す（最小化なら復元も）。Explorer 転送でタブが生えたときに呼ぶ。
+// winit の set_minimized(false) が Windows で不安定なため Win32 を直接叩く。前面化は
+// 転送プロセス側の AllowSetForegroundWindow で許可済み。SW_RESTORE は最大化も戻して
+// しまうので、IsIconic（最小化）判定を挟み「最小化のときだけ復元」する。
+pub(crate) fn bring_to_front(frame: &eframe::Frame) {
+    use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    };
+    let Ok(handle) = frame.window_handle() else { return };
+    let RawWindowHandle::Win32(h) = handle.as_raw() else { return };
+    let hwnd = HWND(h.hwnd.get() as *mut core::ffi::c_void);
+    unsafe {
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE); // 最小化のときだけ復元
+        }
+        let _ = SetForegroundWindow(hwnd);
+    }
 }
 
 // MessageBox（はい/いいえ等）。UX は標準ダイアログのみで完結させ、依存を増やさない。

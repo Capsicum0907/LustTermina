@@ -78,6 +78,13 @@ pub(crate) fn ipc_try_forward(verb: &str, path: &str) -> bool {
         let msg = format!("{verb}\t{path}");
         let ok = WriteFile(handle, Some(msg.as_bytes()), None, None).is_ok();
         let _ = CloseHandle(handle);
+        if ok {
+            // 本体（既存インスタンス）が Focus 要求で前面化できるよう、フォアグラウンド権を委譲。
+            // Explorer から起動されたこの転送プロセスは前面権を持つので、それを本体へ渡せる
+            // （Windows のフォアグラウンド・ロック回避）。ASFW_ANY＝任意プロセスに許可。
+            use windows::Win32::UI::WindowsAndMessaging::{AllowSetForegroundWindow, ASFW_ANY};
+            let _ = AllowSetForegroundWindow(ASFW_ANY);
+        }
         ok
     }
 }
