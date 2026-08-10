@@ -17,6 +17,15 @@ pub(crate) const WARN_COLOR: Color32 = Color32::from_rgb(0xE0, 0x8A, 0x3A);
 pub(crate) const DANGER_FILL: Color32 = Color32::from_rgb(0x5A, 0x28, 0x28);
 pub(crate) const DANGER_BORDER: Color32 = Color32::from_rgb(0x8A, 0x40, 0x40);
 
+// 確認モーダル（タブを閉じる／終了する）の配色。設定画面の danger_button より前面で
+// 面積も小さいため、同じ役割でもこちらは明るい赤を使う。
+pub(crate) const MODAL_BG: Color32 = Color32::from_gray(32);
+pub(crate) const MODAL_BORDER: Color32 = Color32::from_gray(60);
+pub(crate) const MODAL_TITLE_TEXT: Color32 = Color32::from_gray(235);
+pub(crate) const MODAL_DETAIL_TEXT: Color32 = Color32::from_gray(185);
+pub(crate) const MODAL_DANGER_FILL: Color32 = Color32::from_rgb(0xC0, 0x4A, 0x4A);
+pub(crate) const MODAL_NEUTRAL_FILL: Color32 = Color32::from_gray(52);
+
 // テキスト選択のハイライト（半透明。下地の bg・セル色の上に重ねて使う）
 pub(crate) const SELECTION_BG: Color32 = Color32::from_rgba_premultiplied(0x3A, 0x5A, 0x8C, 0x88);
 

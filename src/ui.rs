@@ -328,6 +328,64 @@ pub(crate) fn danger_button(ui: &mut egui::Ui, label: &str) -> bool {
     settings_btn(ui, label, DANGER_FILL, DANGER_BORDER)
 }
 
+// ---- 確認モーダル（破壊的操作の直前に挟む共通形）----
+const MODAL_WIDTH: f32 = 240.0;
+const MODAL_BUTTON_SIZE: Vec2 = Vec2::new(96.0, 30.0);
+
+fn modal_button(ui: &mut egui::Ui, label: &str, fill: Color32, text: Color32) -> bool {
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).color(text))
+            .fill(fill)
+            .corner_radius(6.0)
+            .min_size(MODAL_BUTTON_SIZE),
+    )
+    .clicked()
+}
+
+// 「本当にやりますか？」を一枚のモーダルで尋ねる。タブを閉じる／アプリを終了する等、
+// 取り返しのつかない操作の直前に挟む。呼び出し側は戻り値だけを見ればよい：
+//   Some(true)  = 実行する
+//   Some(false) = やめる（キャンセル・Esc・外側クリック）＝呼び出し側で表示状態を畳む
+//   None        = まだ選んでいない＝出したまま次フレームへ
+pub(crate) fn confirm_modal(
+    ctx: &egui::Context,
+    id: &str,
+    title: &str,
+    detail: &str,
+    confirm_label: &str,
+) -> Option<bool> {
+    let frame = egui::Frame::new()
+        .fill(MODAL_BG)
+        .inner_margin(egui::Margin::same(16))
+        .corner_radius(10.0)
+        .stroke(egui::Stroke::new(1.0, MODAL_BORDER));
+    let mut answer = None;
+    let mr = egui::Modal::new(egui::Id::new(id)).frame(frame).show(ctx, |ui| {
+        ui.set_width(MODAL_WIDTH);
+        ui.label(egui::RichText::new(title).size(16.0).color(MODAL_TITLE_TEXT));
+        if !detail.is_empty() {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new(detail).color(MODAL_DETAIL_TEXT));
+        }
+        ui.add_space(18.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            // 実行＝破壊的操作なので赤系、キャンセル＝中立でダークに馴染ませる。
+            if modal_button(ui, confirm_label, MODAL_DANGER_FILL, Color32::WHITE) {
+                answer = Some(true);
+            }
+            if modal_button(ui, "キャンセル", MODAL_NEUTRAL_FILL, MODAL_TITLE_TEXT) {
+                answer = Some(false);
+            }
+        });
+    });
+    // 外側クリック / Esc でキャンセル扱い
+    if mr.backdrop_response.clicked() || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        answer = Some(false);
+    }
+    answer
+}
+
 // カード左端のドラッグハンドル＝2列×3行の点（「クリリンの額」）。
 pub(crate) fn draw_grip_dots(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
     let cx = rect.center().x;

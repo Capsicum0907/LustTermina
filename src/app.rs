@@ -20,6 +20,11 @@ pub(crate) struct App {
     pub(crate) editing: Option<usize>,       // タブ名編集中のインデックス
     pub(crate) editing_init: bool,           // 編集開始フレームでフォーカスを要求するため
     pub(crate) confirm_close: Option<usize>, // ×押下→閉じる確認待ちのインデックス
+    pub(crate) confirm_exit: bool,           // ウィンドウを閉じる操作→終了確認待ち
+    // 終了を素通しさせる印。ユーザーが確認で「終了する」を選んだとき、および
+    // アプリ内部から意図して閉じるとき（アンインストール後・スクリプト完走）に立てる。
+    // 一度立てたら下ろさない（Close は次フレーム以降に close_requested として返るため）。
+    pub(crate) allow_close: bool,
     pub(crate) drag: Option<TabDrag>,        // ドラッグ中のタブ（D&D 並べ替え）
     pub(crate) settings_open: bool,          // 設定モーダルを表示中か
     pub(crate) settings_tab: SettingsTab,    // 設定モーダルで開いているタブ
@@ -242,6 +247,8 @@ impl App {
             editing: None,
             editing_init: false,
             confirm_close: None,
+            confirm_exit: false,
+            allow_close: false,
             drag: None,
             settings_open: false,
             settings_tab: SettingsTab::General,
@@ -1044,6 +1051,8 @@ impl App {
                             if let Some(delete) = ask_uninstall() {
                                 perform_uninstall(scope, delete);
                                 // 本体を閉じてファイルロックを解放し、インストール先の自己削除を完了させる。
+                                // 内部由来の終了なので、終了確認は挟まない。
+                                self.allow_close = true;
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                             }
                         }
@@ -1101,6 +1110,16 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
+        // ウィンドウを閉じる操作（タイトルバーの×・Alt+F4・タスクバー・タスクバーの右クリック）は、
+        // 一度差し止めて確認を挟む。誤クリック1回で全タブのシェル（実行中のプロセス）が
+        // まとめて落ちるのを防ぐため。allow_close が立っているときだけ素通しする＝
+        // 「確認で終了を選んだ」「内部から意図して閉じた」の2経路のみが実際の終了に到達する。
+        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm_close = None; // モーダルを2枚重ねない（タブの確認は畳む）
+            self.confirm_exit = true;
+        }
+
         // 枠（タイトルバー）のダークが外部要因で剥がれることがあるため、
         // フォーカス獲得時＋一定間隔で再適用する（詳細は apply_dark_titlebar のコメント）。
         let focused = ctx.input(|i| i.focused);
@@ -1149,6 +1168,8 @@ impl eframe::App for App {
                         Ok(Some(status)) => {
                             if status.success() {
                                 if self.sessions.len() == 1 {
+                                    // スクリプトの完走による終了＝ユーザーの意図どおりなので確認は挟まない。
+                                    self.allow_close = true;
                                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                                     self.sessions[i].close_on_exit = false; // 多重送信を避ける
                                 } else {
@@ -1205,7 +1226,12 @@ impl eframe::App for App {
 
         // Ctrl+Tab で一つ下、Ctrl+Shift+Tab で一つ上のタブへ（端は循環）
         let n = self.sessions.len();
-        if n > 0 && self.editing.is_none() && self.confirm_close.is_none() && !self.settings_open {
+        if n > 0
+            && self.editing.is_none()
+            && self.confirm_close.is_none()
+            && !self.confirm_exit
+            && !self.settings_open
+        {
             let (next, prev) = ctx.input(|i| {
                 let ct = i.modifiers.ctrl && i.key_pressed(egui::Key::Tab);
                 (ct && !i.modifiers.shift, ct && i.modifiers.shift)
@@ -1559,8 +1585,10 @@ impl eframe::App for App {
         let cell_h = (ch * ppp).round().max(1.0) / ppp;
 
         // タブ名編集中／確認ダイアログ／設定モーダル表示中は端末入力を止める
-        let block_input =
-            self.editing.is_some() || self.confirm_close.is_some() || self.settings_open;
+        let block_input = self.editing.is_some()
+            || self.confirm_close.is_some()
+            || self.confirm_exit
+            || self.settings_open;
 
         // 入力・スクロールはアクティブなセッションにのみ流す（設定ページ表示中は止める）。
         let active_idx = self.active;
@@ -1593,67 +1621,53 @@ impl eframe::App for App {
                 });
         }
 
+        // 終了確認ダイアログ（ウィンドウの×等の誤操作対策）。開いているシェルが全部落ちる
+        // ＝タブ1枚を閉じるより影響が大きいので、こちらを優先して1枚だけ出す。
+        if self.confirm_exit {
+            let n = self.sessions.len();
+            match confirm_modal(
+                &ctx,
+                "confirm_exit",
+                "LustTermina を終了しますか？",
+                &format!("開いている {n} 個のタブのシェルが、すべて終了します。"),
+                "終了する",
+            ) {
+                Some(true) => {
+                    // 確認を通った終了だけが素通しの印を持つ。次フレームの close_requested で実際に閉じる。
+                    self.allow_close = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                Some(false) => self.confirm_exit = false,
+                None => {}
+            }
+        }
         // タブを閉じる確認ダイアログ（誤クリック対策）
-        if let Some(idx) = self.confirm_close {
+        else if let Some(idx) = self.confirm_close {
             let title = self
                 .sessions
                 .get(idx)
                 .map(|s| s.title.clone())
                 .unwrap_or_default();
-            let frame = egui::Frame::new()
-                .fill(Color32::from_gray(32))
-                .inner_margin(egui::Margin::same(16))
-                .corner_radius(10.0)
-                .stroke(egui::Stroke::new(1.0, Color32::from_gray(60)));
-            let mr = egui::Modal::new(egui::Id::new("confirm_close"))
-                .frame(frame)
-                .show(&ctx, |ui| {
-                    ui.set_width(240.0);
-                    ui.label(
-                        egui::RichText::new("タブを閉じますか？")
-                            .size(16.0)
-                            .color(Color32::from_gray(235)),
-                    );
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new(format!("「{title}」")).color(Color32::from_gray(185)));
-                    ui.add_space(18.0);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.spacing_mut().item_spacing.x = 8.0;
-                        // 「閉じる」＝破壊的操作なので赤系
-                        let close = ui.add(
-                            egui::Button::new(egui::RichText::new("閉じる").color(Color32::WHITE))
-                                .fill(Color32::from_rgb(0xC0, 0x4A, 0x4A))
-                                .corner_radius(6.0)
-                                .min_size(Vec2::new(96.0, 30.0)),
-                        );
-                        if close.clicked() {
-                            if idx < self.sessions.len() {
-                                self.sessions.remove(idx);
-                                if self.active >= self.sessions.len() {
-                                    self.active = self.sessions.len().saturating_sub(1);
-                                } else if self.active > idx {
-                                    self.active -= 1;
-                                }
-                            }
-                            self.confirm_close = None;
+            match confirm_modal(
+                &ctx,
+                "confirm_close",
+                "タブを閉じますか？",
+                &format!("「{title}」"),
+                "閉じる",
+            ) {
+                Some(true) => {
+                    if idx < self.sessions.len() {
+                        self.sessions.remove(idx);
+                        if self.active >= self.sessions.len() {
+                            self.active = self.sessions.len().saturating_sub(1);
+                        } else if self.active > idx {
+                            self.active -= 1;
                         }
-                        // 「キャンセル」＝中立。ダークに馴染ませる
-                        let cancel = ui.add(
-                            egui::Button::new(
-                                egui::RichText::new("キャンセル").color(Color32::from_gray(235)),
-                            )
-                            .fill(Color32::from_gray(52))
-                            .corner_radius(6.0)
-                            .min_size(Vec2::new(96.0, 30.0)),
-                        );
-                        if cancel.clicked() {
-                            self.confirm_close = None;
-                        }
-                    });
-                });
-            // 外側クリック / Esc でキャンセル
-            if mr.backdrop_response.clicked() || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                self.confirm_close = None;
+                    }
+                    self.confirm_close = None;
+                }
+                Some(false) => self.confirm_close = None,
+                None => {}
             }
         }
 
