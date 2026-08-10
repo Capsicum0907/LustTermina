@@ -330,7 +330,10 @@ pub(crate) fn danger_button(ui: &mut egui::Ui, label: &str) -> bool {
 
 // ---- 確認モーダル（破壊的操作の直前に挟む共通形）----
 const MODAL_WIDTH: f32 = 240.0;
-const MODAL_BUTTON_SIZE: Vec2 = Vec2::new(96.0, 30.0);
+// 第三の選択肢を出すときは、ボタン3つ（幅＋間隔）が1行に収まる幅に広げる。
+const MODAL_WIDTH_WIDE: f32 = 3.0 * MODAL_BUTTON_SIZE.x + 2.0 * MODAL_BUTTON_GAP;
+const MODAL_BUTTON_SIZE: Vec2 = Vec2::new(104.0, 30.0);
+const MODAL_BUTTON_GAP: f32 = 8.0;
 
 fn modal_button(ui: &mut egui::Ui, label: &str, fill: Color32, text: Color32) -> bool {
     ui.add(
@@ -342,18 +345,28 @@ fn modal_button(ui: &mut egui::Ui, label: &str, fill: Color32, text: Color32) ->
     .clicked()
 }
 
+/// 確認モーダルで選ばれたもの。
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum ConfirmChoice {
+    /// 赤いボタン＝取り返しのつかない方の実行。
+    Confirm,
+    /// 第三の選択肢（例：終了せずに裏で動かす）。`alt_label` を渡したときだけ出る。
+    Alt,
+    /// やめる（キャンセル・Esc・外側クリック）。呼び出し側で表示状態を畳む。
+    Cancel,
+}
+
 // 「本当にやりますか？」を一枚のモーダルで尋ねる。タブを閉じる／アプリを終了する等、
-// 取り返しのつかない操作の直前に挟む。呼び出し側は戻り値だけを見ればよい：
-//   Some(true)  = 実行する
-//   Some(false) = やめる（キャンセル・Esc・外側クリック）＝呼び出し側で表示状態を畳む
-//   None        = まだ選んでいない＝出したまま次フレームへ
+// 取り返しのつかない操作の直前に挟む。`alt_label` を渡すと、実行でもキャンセルでもない
+// 第三の道（終了の代わりに裏へ回す等）を並べる。戻り値が None の間は出したまま。
 pub(crate) fn confirm_modal(
     ctx: &egui::Context,
     id: &str,
     title: &str,
     detail: &str,
     confirm_label: &str,
-) -> Option<bool> {
+    alt_label: Option<&str>,
+) -> Option<ConfirmChoice> {
     let frame = egui::Frame::new()
         .fill(MODAL_BG)
         .inner_margin(egui::Margin::same(16))
@@ -361,7 +374,7 @@ pub(crate) fn confirm_modal(
         .stroke(egui::Stroke::new(1.0, MODAL_BORDER));
     let mut answer = None;
     let mr = egui::Modal::new(egui::Id::new(id)).frame(frame).show(ctx, |ui| {
-        ui.set_width(MODAL_WIDTH);
+        ui.set_width(if alt_label.is_some() { MODAL_WIDTH_WIDE } else { MODAL_WIDTH });
         ui.label(egui::RichText::new(title).size(16.0).color(MODAL_TITLE_TEXT));
         if !detail.is_empty() {
             ui.add_space(8.0);
@@ -369,19 +382,24 @@ pub(crate) fn confirm_modal(
         }
         ui.add_space(18.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            // 実行＝破壊的操作なので赤系、キャンセル＝中立でダークに馴染ませる。
+            ui.spacing_mut().item_spacing.x = MODAL_BUTTON_GAP;
+            // 実行＝破壊的操作なので赤系。第三の道とキャンセルは中立でダークに馴染ませる。
             if modal_button(ui, confirm_label, MODAL_DANGER_FILL, Color32::WHITE) {
-                answer = Some(true);
+                answer = Some(ConfirmChoice::Confirm);
+            }
+            if let Some(alt) = alt_label {
+                if modal_button(ui, alt, MODAL_NEUTRAL_FILL, MODAL_TITLE_TEXT) {
+                    answer = Some(ConfirmChoice::Alt);
+                }
             }
             if modal_button(ui, "キャンセル", MODAL_NEUTRAL_FILL, MODAL_TITLE_TEXT) {
-                answer = Some(false);
+                answer = Some(ConfirmChoice::Cancel);
             }
         });
     });
     // 外側クリック / Esc でキャンセル扱い
     if mr.backdrop_response.clicked() || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-        answer = Some(false);
+        answer = Some(ConfirmChoice::Cancel);
     }
     answer
 }

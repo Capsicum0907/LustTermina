@@ -1708,19 +1708,36 @@ impl eframe::App for App {
         // ＝タブ1枚を閉じるより影響が大きいので、こちらを優先して1枚だけ出す。
         if self.confirm_exit {
             let n = self.sessions.len();
+            // 「裏で動かす」はトレイアイコンが出ているときだけ並べる。押しても失敗する
+            // ボタンを見せない＝戻る道が無い状態を選ばせない。
+            let alt = tray_ready().then_some("裏で動かす");
+            let detail = if alt.is_some() {
+                format!(
+                    "開いている {n} 個のタブのシェルが、すべて終了します。\n\
+                     裏で動かせば、ウィンドウを閉じてもシェルは動いたまま通知領域に残ります。"
+                )
+            } else {
+                format!("開いている {n} 個のタブのシェルが、すべて終了します。")
+            };
             match confirm_modal(
                 &ctx,
                 "confirm_exit",
                 "LustTermina を終了しますか？",
-                &format!("開いている {n} 個のタブのシェルが、すべて終了します。"),
+                &detail,
                 "終了する",
+                alt,
             ) {
-                Some(true) => {
+                Some(ConfirmChoice::Confirm) => {
                     // 確認を通った終了だけが素通しの印を持つ。次フレームの close_requested で実際に閉じる。
                     self.allow_close = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
-                Some(false) => self.confirm_exit = false,
+                Some(ConfirmChoice::Alt) => {
+                    // 終了せず、ウィンドウだけ畳む。シェルと PTY はそのまま動き続ける。
+                    self.confirm_exit = false;
+                    self.hide_window(&ctx);
+                }
+                Some(ConfirmChoice::Cancel) => self.confirm_exit = false,
                 None => {}
             }
         }
@@ -1737,8 +1754,9 @@ impl eframe::App for App {
                 "タブを閉じますか？",
                 &format!("「{title}」"),
                 "閉じる",
+                None,
             ) {
-                Some(true) => {
+                Some(ConfirmChoice::Confirm) => {
                     if idx < self.sessions.len() {
                         self.sessions.remove(idx);
                         if self.active >= self.sessions.len() {
@@ -1749,7 +1767,7 @@ impl eframe::App for App {
                     }
                     self.confirm_close = None;
                 }
-                Some(false) => self.confirm_close = None,
+                Some(_) => self.confirm_close = None, // キャンセル（第三の選択肢は出していない）
                 None => {}
             }
         }
