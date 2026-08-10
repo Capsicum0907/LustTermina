@@ -20,6 +20,7 @@ mod input;
 mod ipc;
 mod session;
 mod shells;
+mod tray;
 mod ui;
 mod winintegration;
 

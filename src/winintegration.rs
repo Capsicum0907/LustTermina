@@ -545,14 +545,33 @@ pub(crate) fn apply_dark_titlebar(frame: &eframe::Frame) {
 // 転送プロセス側の AllowSetForegroundWindow で許可済み。SW_RESTORE は最大化も戻して
 // しまうので、IsIconic（最小化）判定を挟み「最小化のときだけ復元」する。
 pub(crate) fn bring_to_front(frame: &eframe::Frame) {
+    if let Some(hwnd) = main_hwnd(frame) {
+        bring_hwnd_to_front(hwnd);
+    }
+}
+
+// 本体ウィンドウのハンドル（数値）。eframe の Frame を持たない場所（トレイの
+// ウィンドウプロシージャ等）へ渡せるよう、生の isize で取り出す。
+pub(crate) fn main_hwnd(frame: &eframe::Frame) -> Option<isize> {
     use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+    let handle = frame.window_handle().ok()?;
+    let RawWindowHandle::Win32(h) = handle.as_raw() else {
+        return None;
+    };
+    Some(h.hwnd.get() as isize)
+}
+
+// 前面化の実体。eframe の描画フレームの中からも、トレイのクリック（ウィンドウ
+// プロシージャの中＝egui のフレームが回っていない状況）からも、同じ処理を使う。
+pub(crate) fn bring_hwnd_to_front(hwnd: isize) {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
         IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE,
     };
-    let Ok(handle) = frame.window_handle() else { return };
-    let RawWindowHandle::Win32(h) = handle.as_raw() else { return };
-    let hwnd = HWND(h.hwnd.get() as *mut core::ffi::c_void);
+    if hwnd == 0 {
+        return;
+    }
+    let hwnd = HWND(hwnd as *mut core::ffi::c_void);
     unsafe {
         if IsIconic(hwnd).as_bool() {
             let _ = ShowWindow(hwnd, SW_RESTORE); // 最小化のときだけ復元

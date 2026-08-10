@@ -8,9 +8,14 @@ use crate::session::*;
 use crate::shells::*;
 use crate::icons::*;
 use crate::ipc::*;
+use crate::tray::*;
 use crate::ui::*;
 use crate::winintegration::*;
 use crate::FONT_SIZE;
+
+// 隠していたウィンドウを再表示してから前面化するまで置くフレーム数。Visible(true) は
+// このフレームの描画後に適用されるため、間を置かずに前面化しても相手がまだ不可視で効かない。
+const FRONT_DELAY_FRAMES: u8 = 2;
 
 // ---- アプリ本体（複数セッション ＋ 縦タブ）----
 pub(crate) struct App {
@@ -25,6 +30,12 @@ pub(crate) struct App {
     // アプリ内部から意図して閉じるとき（アンインストール後・スクリプト完走）に立てる。
     // 一度立てたら下ろさない（Close は次フレーム以降に close_requested として返るため）。
     pub(crate) allow_close: bool,
+    // ウィンドウを隠して裏で動かしているか（シェルは生きたまま）。戻す入口はトレイアイコン。
+    pub(crate) hidden: bool,
+    // 再表示後に前面化するまでの残りフレーム数（0＝予定なし。詳細は show_window）。
+    pub(crate) pending_front: u8,
+    // 本体ウィンドウのハンドルをトレイ側へ渡し終えたか。
+    pub(crate) hwnd_shared: bool,
     pub(crate) drag: Option<TabDrag>,        // ドラッグ中のタブ（D&D 並べ替え）
     pub(crate) settings_open: bool,          // 設定モーダルを表示中か
     pub(crate) settings_tab: SettingsTab,    // 設定モーダルで開いているタブ
@@ -67,6 +78,9 @@ impl App {
         // ネイティブ枠のままなのでリサイズ/スナップ/最大化は維持。
         cc.egui_ctx
             .send_viewport_cmd(egui::ViewportCommand::SetTheme(egui::SystemTheme::Dark));
+        // 通知領域に常駐する。ウィンドウを隠して裏で動かすときの唯一の目印であり戻る入口。
+        // 失敗しても起動は続ける（隠す操作だけが使えなくなる＝tray_ready で判定する）。
+        install_tray(&cc.egui_ctx);
         let home = home_dir();
         let shells = discover_shells();
         // 各シェルの exe からアイコンを抽出してテクスチャ化（メニュー表示用）
@@ -249,6 +263,9 @@ impl App {
             confirm_close: None,
             confirm_exit: false,
             allow_close: false,
+            hidden: false,
+            pending_front: 0,
+            hwnd_shared: false,
             drag: None,
             settings_open: false,
             settings_tab: SettingsTab::General,
@@ -1106,6 +1123,40 @@ impl App {
         self.active = insert; // 掴んだタブはドラッグ開始時にアクティブ化済み
     }
 }
+impl App {
+    // ウィンドウを表に戻す（隠していないときは前面に出すだけ）。トレイのクリック、
+    // Explorer からの合流（新しいタブが生えた）で使う。
+    fn show_window(&mut self, ctx: &egui::Context) {
+        if self.hidden {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            self.hidden = false;
+        }
+        // Visible(true) はこのフレームの描画後に適用されるため、同じフレームで前面化しても
+        // まだ不可視のウィンドウが相手で効かない。数フレーム置いてから前面化する。
+        self.pending_front = FRONT_DELAY_FRAMES;
+        ctx.request_repaint();
+    }
+
+    // ウィンドウだけ消して、シェル（PTY と読み取りスレッド）は動かし続ける。
+    // トレイアイコンが出せていないときは隠さない＝戻す入口の無いプロセスを作らない。
+    fn hide_window(&mut self, ctx: &egui::Context) {
+        if !tray_ready() {
+            self.show_toast("通知領域に常駐できていないため、隠せません");
+            return;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        self.hidden = true;
+    }
+}
+
+// 終了時にトレイアイコンを消す。残すとプロセスが居なくなった後も、通知領域を
+// マウスが通るまでアイコンの残骸が表示され続ける。
+impl Drop for App {
+    fn drop(&mut self) {
+        remove_tray();
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
@@ -1118,6 +1169,37 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.confirm_close = None; // モーダルを2枚重ねない（タブの確認は畳む）
             self.confirm_exit = true;
+        }
+
+        // 本体ウィンドウのハンドルをトレイ側へ預ける（最小化からの復元に使う）。
+        // Frame はこの中でしか手に入らず、ウィンドウは初回フレームより後に確定することも
+        // あるため、未設定のうちは毎フレーム試す。
+        if !self.hwnd_shared {
+            if let Some(hwnd) = main_hwnd(frame) {
+                set_main_window(hwnd);
+                self.hwnd_shared = true;
+            }
+        }
+
+        // トレイアイコンで押されたものを回収して実行する。可視状態の管理は eframe 側に一本化し、
+        // ここでビューポート命令に変換する（wndproc から直接 ShowWindow は呼ばない）。
+        match take_tray_request() {
+            TrayRequest::Show => self.show_window(&ctx),
+            TrayRequest::Hide => self.hide_window(&ctx),
+            TrayRequest::Exit => {
+                // 隠したまま確認を出すと見えないので、先に窓を戻してから通常の終了確認へ。
+                self.show_window(&ctx);
+                self.confirm_exit = true;
+            }
+            TrayRequest::None => {}
+        }
+        // 再表示の予約：Visible(true) が効いたころ合いで前面に出す（show_window のコメント）。
+        if self.pending_front > 0 {
+            self.pending_front -= 1;
+            if self.pending_front == 0 {
+                bring_to_front(frame);
+            }
+            ctx.request_repaint();
         }
 
         // 枠（タイトルバー）のダークが外部要因で剥がれることがあるため、
@@ -1149,10 +1231,11 @@ impl eframe::App for App {
                     IpcMsg::OpenTab(req) => self.open_requested_tab(&ctx, req),
                 }
             }
-            // Explorer 等から転送されてタブが生えたら、窓を前面へ出す（最小化なら復元）。
-            // winit 経由だと最小化復元が不安定なので Win32 直（bring_to_front）で行う。
+            // Explorer 等から転送されてタブが生えたら、窓を前面へ出す（最小化なら復元、
+            // 裏で動かしている最中なら再表示）。転送したのに何も起きないと、送った側からは
+            // 失敗と区別が付かないため、隠している状態こそ必ず表に戻す。
             if forwarded {
-                bring_to_front(frame);
+                self.show_window(&ctx);
             }
         }
 
