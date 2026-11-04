@@ -1,5 +1,6 @@
 //! アプリ本体：App 状態・更新ループ（eframe::App 実装）。
 use crate::Launch;
+use crate::{PAD, PLAYBACK_FONT_STEP, PLAYBACK_MIN_FONT_SIZE};
 use std::sync::mpsc;
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Sense, Vec2};
 use crate::color::*;
@@ -1786,13 +1787,7 @@ impl eframe::App for App {
             }
         }
 
-        let font = FontId::monospace(FONT_SIZE);
-        // セル幅・高さを物理ピクセル境界に丸める。端数だと列ごとに 1px ズレて
-        // 文字間隔が不揃いに見える（等幅なのにガタつく）ため。
-        let ppp = ctx.pixels_per_point();
-        let (cw, ch) = ctx.fonts_mut(|f| (f.glyph_width(&font, 'M'), f.row_height(&font)));
-        let cell_w = (cw * ppp).round().max(1.0) / ppp;
-        let cell_h = (ch * ppp).round().max(1.0) / ppp;
+        let (font, cell_w, cell_h) = cell_metrics(&ctx, FONT_SIZE);
 
         // タブ名編集中／確認ダイアログ／設定モーダル表示中は端末入力を止める
         let block_input = self.editing.is_some()
@@ -1841,6 +1836,12 @@ impl eframe::App for App {
                     if let Some(ctl) = self.sessions[active_idx].playback.clone() {
                         playback_bar(ui, &ctl);
                     }
+                    let (font, cell_w, cell_h) = match self.sessions[active_idx].playback_grid() {
+                        Some((cols, rows)) => {
+                            fit_metrics(&ctx, cols, rows, ui.available_size() - egui::Vec2::splat(2.0 * PAD))
+                        }
+                        None => (font.clone(), cell_w, cell_h),
+                    };
                     self.sessions[active_idx]
                         .draw(ui, &ctx, &font, cell_w, cell_h, !block_input);
                 });
@@ -1956,3 +1957,26 @@ impl eframe::App for App {
     }
 }
 
+
+// セル幅・高さを物理ピクセル境界に丸める。端数だと列ごとに 1px ズレて
+// 文字間隔が不揃いに見える（等幅なのにガタつく）ため。
+fn cell_metrics(ctx: &egui::Context, size: f32) -> (FontId, f32, f32) {
+    let font = FontId::monospace(size);
+    let ppp = ctx.pixels_per_point();
+    let (cw, ch) = ctx.fonts_mut(|f| (f.glyph_width(&font, 'M'), f.row_height(&font)));
+    let cell_w = (cw * ppp).round().max(1.0) / ppp;
+    let cell_h = (ch * ppp).round().max(1.0) / ppp;
+    (font, cell_w, cell_h)
+}
+
+fn fit_metrics(ctx: &egui::Context, cols: usize, rows: usize, avail: egui::Vec2) -> (FontId, f32, f32) {
+    let mut size = FONT_SIZE;
+    loop {
+        let (font, cw, ch) = cell_metrics(ctx, size);
+        let fits = cols as f32 * cw <= avail.x && rows as f32 * ch <= avail.y;
+        if fits || size <= PLAYBACK_MIN_FONT_SIZE {
+            return (font, cw, ch);
+        }
+        size = (size - PLAYBACK_FONT_STEP).max(PLAYBACK_MIN_FONT_SIZE);
+    }
+}

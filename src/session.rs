@@ -636,6 +636,12 @@ impl Session {
         }
     }
 
+    pub(crate) fn playback_grid(&self) -> Option<(usize, usize)> {
+        self.playback.as_ref()?;
+        let term = self.term.lock().ok()?;
+        Some((term.columns(), term.screen_lines()))
+    }
+
     pub(crate) fn is_recording(&self) -> bool {
         self.recording.lock().map(|r| r.is_some()).unwrap_or(false)
     }
