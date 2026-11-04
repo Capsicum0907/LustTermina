@@ -5,7 +5,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::Term;
+use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::Processor;
 use eframe::egui;
 use log::Level;
@@ -20,12 +23,16 @@ const PART_MARK: &str = "_part";
 const RESET_SEQUENCE: &[u8] = b"\x1bc";
 const NO_SEEK: u64 = u64::MAX;
 const UNKNOWN: u64 = u64::MAX;
+const SNAPSHOT_GAP_MS: f64 = 150.0;
+const MIN_OVERLAP: usize = 2;
 
 pub(crate) struct PlaybackCtl {
     pub(crate) paused: AtomicBool,
     pub(crate) speed: AtomicU32,
     pub(crate) finished: AtomicBool,
     pub(crate) pos_ms: AtomicU64,
+    pub(crate) history_view: AtomicBool,
+    pub(crate) transcript: Mutex<Transcript>,
     total_ms: AtomicU64,
     seek_to: AtomicU64,
     stop: AtomicBool,
@@ -38,6 +45,8 @@ impl PlaybackCtl {
             speed: AtomicU32::new(SPEEDS[0]),
             finished: AtomicBool::new(false),
             pos_ms: AtomicU64::new(0),
+            history_view: AtomicBool::new(false),
+            transcript: Mutex::new(Transcript::default()),
             total_ms: AtomicU64::new(UNKNOWN),
             seek_to: AtomicU64::new(NO_SEEK),
             stop: AtomicBool::new(false),
@@ -205,6 +214,9 @@ impl Player {
             }
             ctl.pos_ms.store(0, Ordering::Relaxed);
             ctl.finished.store(false, Ordering::Relaxed);
+            if let Ok(mut t) = ctl.transcript.lock() {
+                *t = Transcript::default();
+            }
             let mut clock = Clock::new(self.idle_limit);
             match self.play_all(ctl, &mut parser, &mut clock, &mut fast_until) {
                 Ok(Outcome::Stopped) => return,
@@ -241,6 +253,7 @@ impl Player {
         clock: &mut Clock,
         fast_until: &mut Option<u64>,
     ) -> Result<Outcome, String> {
+        let mut dirty = false;
         for path in &self.files {
             let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
             let mut lines = BufReader::new(file).lines();
@@ -264,6 +277,9 @@ impl Player {
                 let before = clock.now_ms;
                 let gap = clock.gap_ms(t);
                 let at = before + gap;
+                if dirty && gap >= SNAPSHOT_GAP_MS {
+                    self.snapshot(ctl);
+                }
                 if let Some(seek) = ctl.take_seek() {
                     if (seek as f64) < before {
                         return Ok(Outcome::Restart(seek));
@@ -290,15 +306,29 @@ impl Player {
                 clock.now_ms = at;
                 ctl.pos_ms.store(at as u64, Ordering::Relaxed);
                 self.apply(parser, &kind, &data);
+                dirty = true;
                 if !fast {
                     self.ctx.request_repaint();
                 }
             }
         }
+        if dirty {
+            self.snapshot(ctl);
+        }
         if fast_until.take().is_some() {
             self.ctx.request_repaint();
         }
         Ok(Outcome::Done)
+    }
+
+    fn snapshot(&self, ctl: &PlaybackCtl) {
+        let screen = match self.term.lock() {
+            Ok(term) => screen_text(&term),
+            Err(_) => return,
+        };
+        if let Ok(mut t) = ctl.transcript.lock() {
+            t.merge(screen);
+        }
     }
 
     fn apply(&self, parser: &mut Processor, kind: &str, data: &str) {
@@ -351,8 +381,114 @@ impl Player {
     }
 }
 
+fn screen_text(term: &Term<EventProxy>) -> Vec<String> {
+    let grid = term.grid();
+    (0..term.screen_lines())
+        .map(|i| {
+            let row = &grid[Line(i as i32)];
+            let mut line: String = (0..term.columns())
+                .map(|c| &row[Column(c)])
+                .filter(|cell| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
+                .map(|cell| if cell.c == '\0' { ' ' } else { cell.c })
+                .collect();
+            line.truncate(line.trim_end().len());
+            line
+        })
+        .collect()
+}
+
+#[derive(Default)]
+pub(crate) struct Transcript {
+    committed: Vec<String>,
+    screen: Vec<String>,
+}
+
+impl Transcript {
+    fn screen_used(&self) -> usize {
+        self.screen.iter().rposition(|l| !l.is_empty()).map_or(0, |i| i + 1)
+    }
+
+    pub(crate) fn lines(&self) -> impl Iterator<Item = &String> {
+        self.committed.iter().chain(self.screen[..self.screen_used()].iter())
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.committed.len() + self.screen_used()
+    }
+
+    fn merge(&mut self, next: Vec<String>) {
+        if next == self.screen {
+            return;
+        }
+        match scrolled_off(&self.screen, &next) {
+            Some(k) => self.committed.extend(self.screen.drain(..k)),
+            None => {
+                let kept = self.screen.len() - common_footer(&self.screen, &next);
+                let mut gone: Vec<String> = self.screen.drain(..kept).collect();
+                gone.truncate(gone.iter().rposition(|l| !l.is_empty()).map_or(0, |i| i + 1));
+                self.committed.extend(gone);
+            }
+        }
+        self.screen = next;
+    }
+}
+
+fn common_footer(prev: &[String], next: &[String]) -> usize {
+    let prev = &prev[..prev.iter().rposition(|l| !l.is_empty()).map_or(0, |i| i + 1)];
+    let next = &next[..next.iter().rposition(|l| !l.is_empty()).map_or(0, |i| i + 1)];
+    prev.iter().rev().zip(next.iter().rev()).take_while(|(a, b)| a == b).count()
+}
+
+fn scrolled_off(prev: &[String], next: &[String]) -> Option<usize> {
+    let mut best: Option<(usize, usize)> = None;
+    for k in 0..prev.len() {
+        let run = prev[k..].iter().zip(next).take_while(|(a, b)| a == b).count();
+        let meaningful = prev[k..k + run].iter().filter(|l| !l.is_empty()).count();
+        if meaningful < MIN_OVERLAP.min(next.len()) {
+            continue;
+        }
+        if best.is_none_or(|(r, _)| run > r) {
+            best = Some((run, k));
+        }
+    }
+    best.map(|(_, k)| k)
+}
+
 #[cfg(test)]
 mod tests {
+    fn lines(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn keeps_lines_that_scroll_off_and_drops_redrawn_footers() {
+        let mut t = Transcript::default();
+        t.merge(lines(&["a", "b", "c", "d", "> input 1"]));
+        t.merge(lines(&["a", "b", "c", "d", "> input 2"]));
+        t.merge(lines(&["c", "d", "e", "f", "> input 3"]));
+        let all: Vec<&String> = t.lines().collect();
+        assert_eq!(all, lines(&["a", "b", "c", "d", "e", "f", "> input 3"]).iter().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn drops_blank_screens_and_a_footer_that_stays() {
+        let mut t = Transcript::default();
+        t.merge(lines(&["", "", ""]));
+        t.merge(lines(&["one", "", "> box", "status"]));
+        t.merge(lines(&["two", "three", "> box", "status"]));
+        let all: Vec<&String> = t.lines().collect();
+        assert_eq!(all, lines(&["one", "two", "three", "> box", "status"]).iter().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn keeps_the_whole_screen_when_it_is_replaced() {
+        let mut t = Transcript::default();
+        t.merge(lines(&["one", "two", "three"]));
+        t.merge(lines(&["x", "y", "z"]));
+        let all: Vec<&String> = t.lines().collect();
+        assert_eq!(all, lines(&["one", "two", "three", "x", "y", "z"]).iter().collect::<Vec<_>>());
+    }
+
     use super::*;
 
     #[test]

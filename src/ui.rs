@@ -1285,6 +1285,10 @@ pub(crate) fn playback_bar(ui: &mut egui::Ui, ctl: &crate::playback::PlaybackCtl
                 ctl.speed.store(s, Ordering::Relaxed);
             }
         }
+        let history = ctl.history_view.load(Ordering::Relaxed);
+        if ui.selectable_label(history, "履歴").clicked() {
+            ctl.history_view.store(!history, Ordering::Relaxed);
+        }
         if ui.add_enabled(total.is_some() && !finished, egui::Button::new("最後まで")).clicked() {
             if let Some(t) = total {
                 ctl.seek(t);
@@ -1316,4 +1320,25 @@ pub(crate) fn playback_bar(ui: &mut egui::Ui, ctl: &crate::playback::PlaybackCtl
         }
         ui.label(egui::RichText::new(time).color(Color32::from_gray(150)));
     });
+}
+
+pub(crate) fn playback_history(ui: &mut egui::Ui, ctl: &crate::playback::PlaybackCtl, font: &FontId, row_h: f32) {
+    let Ok(transcript) = ctl.transcript.lock() else { return };
+    let total = transcript.len();
+    egui::Frame::new()
+        .inner_margin(egui::Margin::same(crate::PAD as i8))
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            egui::ScrollArea::both()
+                .auto_shrink([false, false])
+                .stick_to_bottom(true)
+                .show_rows(ui, row_h, total, |ui, range| {
+                    for line in transcript.lines().skip(range.start).take(range.len()) {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(line.as_str()).font(font.clone()).color(DEFAULT_FG))
+                                .extend(),
+                        );
+                    }
+                });
+        });
 }

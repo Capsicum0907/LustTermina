@@ -1847,6 +1847,12 @@ impl eframe::App for App {
                 .show(ui, |ui| {
                     if let Some(ctl) = self.sessions[active_idx].playback.clone() {
                         playback_bar(ui, &ctl);
+                        if ctl.history_view.load(std::sync::atomic::Ordering::Relaxed) {
+                            let font = FontId::new(FONT_SIZE, egui::FontFamily::Name(NARROW_FAMILY.into()));
+                            let row_h = ctx.fonts_mut(|f| f.row_height(&font));
+                            playback_history(ui, &ctl, &font, row_h);
+                            return;
+                        }
                     }
                     let fitted = self.sessions[active_idx].playback_grid().map(|(cols, rows)| {
                         fit_fonts(&ctx, cols, rows, ui.available_size() - egui::Vec2::splat(2.0 * PAD))
