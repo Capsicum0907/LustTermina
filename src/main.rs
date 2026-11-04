@@ -18,6 +18,7 @@ mod config;
 mod icons;
 mod input;
 mod ipc;
+mod logging;
 mod session;
 mod shells;
 mod tray;
@@ -181,6 +182,12 @@ fn main() -> eframe::Result {
     use windows::Win32::System::Registry::HKEY_CURRENT_USER;
     use windows::Win32::UI::WindowsAndMessaging::MB_ICONINFORMATION;
     let launch = parse_launch(std::env::args().skip(1));
+    logging::init(&load_settings().map(|s| s.log).unwrap_or_default());
+    log::info!(
+        "start v{} args={:?}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::args().skip(1).collect::<Vec<_>>()
+    );
     // 窓を出さずに完結する起動（インストール系・右クリック登録/解除）は、ここで実行して終了。
     match &launch {
         Launch::Install => {
@@ -307,9 +314,15 @@ fn main() -> eframe::Result {
             .with_icon(icon),
         ..Default::default()
     };
-    eframe::run_native(
+    let result = eframe::run_native(
         "LustTermina",
         native_options,
         Box::new(move |cc| Ok(Box::new(App::new(cc, launch)))),
-    )
+    );
+    match &result {
+        Ok(()) => log::info!("event loop ended normally"),
+        Err(e) => log::error!("event loop ended with error: {e}"),
+    }
+    log::logger().flush();
+    result
 }

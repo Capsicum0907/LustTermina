@@ -211,6 +211,26 @@ pub(crate) struct Settings {
     pub(crate) startup_quiet_ms: u64,
     #[serde(default = "default_startup_max_wait_ms")]
     pub(crate) startup_max_wait_ms: u64,
+    #[serde(default)]
+    pub(crate) log: LogSettings,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[serde(default)]
+pub(crate) struct LogSettings {
+    pub(crate) level: String,
+    pub(crate) deps_level: String,
+    pub(crate) max_kb: u64,
+}
+
+impl Default for LogSettings {
+    fn default() -> Self {
+        Self {
+            level: "info".into(),
+            deps_level: "warn".into(),
+            max_kb: 4096,
+        }
+    }
 }
 
 // ユーザーのホーム（%USERPROFILE%）。既定 cwd 等の基準。取れなければ空。

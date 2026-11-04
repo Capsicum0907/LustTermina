@@ -50,6 +50,7 @@ pub(crate) struct App {
     pub(crate) panel_right: bool,       // タブパネルを右に置くか（false=左）
     pub(crate) startup_quiet_ms: u64,   // 起動コマンド投入の静穏窓（config 可変、既定 STARTUP_QUIET_MS）
     pub(crate) startup_max_wait_ms: u64, // 同・待ち上限（config 可変、既定 STARTUP_MAX_WAIT_MS）
+    pub(crate) log_settings: LogSettings,
     pub(crate) presets: Vec<TabSpec>,     // 型ライブラリ（再利用できるタブ定義。name が識別子）
     pub(crate) startup: Vec<StartupEntry>, // 起動時に開くタブ定義（空＝既定シェル1枚）
     pub(crate) script_runner: std::collections::BTreeMap<String, String>, // 拡張子→スクリプト実行シェル short
@@ -81,6 +82,16 @@ impl App {
         // 通知領域に常駐する。ウィンドウを隠して裏で動かすときの唯一の目印であり戻る入口。
         // 失敗しても起動は続ける（隠す操作だけが使えなくなる＝tray_ready で判定する）。
         install_tray(&cc.egui_ctx);
+        match &cc.wgpu_render_state {
+            Some(rs) => {
+                let info = rs.adapter.get_info();
+                log::info!(
+                    "renderer wgpu backend={:?} adapter={} type={:?} driver={} {}",
+                    info.backend, info.name, info.device_type, info.driver, info.driver_info
+                );
+            }
+            None => log::info!("renderer is not wgpu"),
+        }
         let home = home_dir();
         let shells = discover_shells();
         // 各シェルの exe からアイコンを抽出してテクスチャ化（メニュー表示用）
@@ -109,6 +120,7 @@ impl App {
         let mut panel_right = false;
         let mut startup_quiet_ms = STARTUP_QUIET_MS;
         let mut startup_max_wait_ms = STARTUP_MAX_WAIT_MS;
+        let mut log_settings = LogSettings::default();
         let mut presets: Vec<TabSpec> = Vec::new();
         let mut startup: Vec<StartupEntry> = Vec::new();
         let mut script_runner: std::collections::BTreeMap<String, String> = Default::default();
@@ -116,6 +128,7 @@ impl App {
             panel_right = cfg.panel == "right";
             startup_quiet_ms = cfg.startup_quiet_ms;
             startup_max_wait_ms = cfg.startup_max_wait_ms;
+            log_settings = cfg.log.clone();
             if let Some(i) = shells.iter().position(|s| s.short == cfg.default_shell) {
                 default_shell = i;
             }
@@ -279,6 +292,7 @@ impl App {
             panel_right,
             startup_quiet_ms,
             startup_max_wait_ms,
+            log_settings,
             presets,
             startup,
             script_runner,
@@ -350,6 +364,7 @@ impl App {
             panel: if self.panel_right { "right".into() } else { "left".into() },
             startup_quiet_ms: self.startup_quiet_ms,
             startup_max_wait_ms: self.startup_max_wait_ms,
+            log: self.log_settings.clone(),
             // 保存時に commands_buf（複数行テキスト）→ commands（行配列、空行除去）へ確定。
             presets: self
                 .presets
@@ -401,6 +416,7 @@ impl App {
         self.panel_right = false;
         self.startup_quiet_ms = STARTUP_QUIET_MS;
         self.startup_max_wait_ms = STARTUP_MAX_WAIT_MS;
+        self.log_settings = LogSettings::default();
         self.presets.clear();
         self.startup.clear();
         self.script_runner.clear();
@@ -1066,6 +1082,7 @@ impl App {
                         if danger_button(ui, "アンインストール") {
                             // 確認とデータ削除選択は共通の TaskDialog（--uninstall と同じ）。
                             if let Some(delete) = ask_uninstall() {
+                                log::info!("closing after uninstall (delete_data={delete})");
                                 perform_uninstall(scope, delete);
                                 // 本体を閉じてファイルロックを解放し、インストール先の自己削除を完了させる。
                                 // 内部由来の終了なので、終了確認は挟まない。
@@ -1128,6 +1145,7 @@ impl App {
     // Explorer からの合流（新しいタブが生えた）で使う。
     fn show_window(&mut self, ctx: &egui::Context) {
         if self.hidden {
+            log::info!("showing window from tray");
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             self.hidden = false;
         }
@@ -1144,6 +1162,7 @@ impl App {
             self.show_toast("通知領域に常駐できていないため、隠せません");
             return;
         }
+        log::info!("hiding window to tray");
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         self.hidden = true;
     }
@@ -1153,6 +1172,7 @@ impl App {
 // マウスが通るまでアイコンの残骸が表示され続ける。
 impl Drop for App {
     fn drop(&mut self) {
+        log::info!("app dropped with {} tab(s)", self.sessions.len());
         remove_tray();
     }
 }
@@ -1166,6 +1186,7 @@ impl eframe::App for App {
         // まとめて落ちるのを防ぐため。allow_close が立っているときだけ素通しする＝
         // 「確認で終了を選んだ」「内部から意図して閉じた」の2経路のみが実際の終了に到達する。
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
+            log::info!("close requested; asking for confirmation");
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.confirm_close = None; // モーダルを2枚重ねない（タブの確認は畳む）
             self.confirm_exit = true;
@@ -1252,6 +1273,7 @@ impl eframe::App for App {
                             if status.success() {
                                 if self.sessions.len() == 1 {
                                     // スクリプトの完走による終了＝ユーザーの意図どおりなので確認は挟まない。
+                                    log::info!("closing after the last script tab exited successfully");
                                     self.allow_close = true;
                                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                                     self.sessions[i].close_on_exit = false; // 多重送信を避ける
@@ -1728,6 +1750,7 @@ impl eframe::App for App {
                 alt,
             ) {
                 Some(ConfirmChoice::Confirm) => {
+                    log::info!("exit confirmed by user");
                     // 確認を通った終了だけが素通しの印を持つ。次フレームの close_requested で実際に閉じる。
                     self.allow_close = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);

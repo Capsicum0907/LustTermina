@@ -923,6 +923,8 @@ pub(crate) fn do_uninstall(scope: InstallScope, delete_config: bool) -> bool {
     }
     if delete_config {
         if let Some(cfg) = config_dir() {
+            log::info!("deleting data folder on uninstall");
+            crate::logging::close();
             let _ = std::fs::remove_dir_all(cfg);
         }
     }

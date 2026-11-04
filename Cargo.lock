@@ -1843,6 +1843,7 @@ version = "0.4.2"
 dependencies = [
  "alacritty_terminal",
  "eframe",
+ "log",
  "portable-pty",
  "raw-window-handle",
  "serde",
