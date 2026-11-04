@@ -184,8 +184,9 @@ fn main() -> eframe::Result {
     let launch = parse_launch(std::env::args().skip(1));
     logging::init(&load_settings().map(|s| s.log).unwrap_or_default());
     log::info!(
-        "start v{} args={:?}",
+        "start v{} ({}) args={:?}",
         env!("CARGO_PKG_VERSION"),
+        env!("LT_BUILD_ID"),
         std::env::args().skip(1).collect::<Vec<_>>()
     );
     // 窓を出さずに完結する起動（インストール系・右クリック登録/解除）は、ここで実行して終了。
