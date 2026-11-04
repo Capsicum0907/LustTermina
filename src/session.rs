@@ -113,7 +113,7 @@ pub(crate) struct Session {
 }
 
 impl Session {
-    pub(crate) fn spawn(ctx: &egui::Context, title: String, spec: &ShellSpec, cwd: &str) -> Self {
+    pub(crate) fn spawn(ctx: &egui::Context, title: String, spec: &ShellSpec, cwd: &str) -> Result<Self, String> {
         Self::spawn_with_env(ctx, title, spec, cwd, &[])
     }
 
@@ -124,7 +124,7 @@ impl Session {
         spec: &ShellSpec,
         cwd: &str,
         extra_env: &[(String, String)],
-    ) -> Self {
+    ) -> Result<Self, String> {
         let init = TermSize { cols: 80, rows: 24 };
         let log = TabLog::open();
         log.event(
@@ -147,7 +147,7 @@ impl Session {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .expect("openpty failed");
+            .map_err(|e| spawn_failed(&log, "could not open a pseudo console", e))?;
 
         // シェルの起動定義（プログラム＋引数）は ShellSpec が持つ（探索結果）。
         let mut cmd = CommandBuilder::new(&spec.program);
@@ -158,12 +158,21 @@ impl Session {
         if !cwd.is_empty() {
             cmd.cwd(cwd);
         }
-        let child = pair.slave.spawn_command(cmd).expect("spawn shell failed");
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .map_err(|e| spawn_failed(&log, &format!("could not start {}", spec.program), e))?;
         drop(pair.slave); // slave 側はもう要らない
         log.event(Level::Info, format_args!("spawned pid={:?}", child.process_id()));
 
-        let reader = pair.master.try_clone_reader().expect("clone reader failed");
-        let writer = pair.master.take_writer().expect("take writer failed");
+        let reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|e| spawn_failed(&log, "could not read from the pseudo console", e))?;
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(|e| spawn_failed(&log, "could not write to the pseudo console", e))?;
         let master: Box<dyn MasterPty + Send> = pair.master;
 
         // writer は UI 入力と Term 書き戻しの両方から使うので Arc<Mutex> に
@@ -220,7 +229,7 @@ impl Session {
             }
         }
 
-        Self {
+        Ok(Self {
             term,
             writer,
             master: Arc::new(Mutex::new(master)),
@@ -239,7 +248,7 @@ impl Session {
             log,
             exit_logged: false,
             logged_props: None,
-        }
+        })
     }
 
     // 起動コマンド列を「出力が静まってから次」の順で投入する（出力アイドル・ゲーティング）。
@@ -858,4 +867,10 @@ impl Drop for Session {
         self.note_props();
         self.log.event(Level::Info, format_args!("tab closed (title={:?})", self.title));
     }
+}
+
+fn spawn_failed(log: &TabLog, what: &str, e: impl std::fmt::Display) -> String {
+    let msg = format!("{what}: {e}");
+    log.event(Level::Error, format_args!("tab not opened: {msg}"));
+    msg
 }

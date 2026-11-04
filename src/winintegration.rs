@@ -253,7 +253,7 @@ pub(crate) fn spawn_script_session(
     runner: &std::collections::BTreeMap<String, String>,
     bg: Color32,
     accent: Color32,
-) -> Session {
+) -> Result<Session, String> {
     // 認識できたスクリプトのみ run-and-close（拡張子不明でフォルダを開くだけのフォールバックは
     // 通常の対話シェルなので閉じない）。
     let script = script_run_shell(path, runner, shells);
@@ -265,11 +265,11 @@ pub(crate) fn spawn_script_session(
         .and_then(|s| s.to_str())
         .map(str::to_string)
         .unwrap_or_else(|| spec.short.clone());
-    let mut s = Session::spawn(ctx, title, &spec, &dir);
+    let mut s = Session::spawn(ctx, title, &spec, &dir)?;
     s.bg = bg;
     s.accent = accent;
     s.close_on_exit = close_on_exit;
-    s
+    Ok(s)
 }
 
 // 右クリック「LustTermina で開く」を登録。指定した exe パスを指す（インストーラは

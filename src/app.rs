@@ -158,6 +158,7 @@ impl App {
         // ただし --cwd で起動された場合（Explorer の「このディレクトリで開く」）は、
         // 起動タブ定義を無視してそのフォルダで1枚だけ開く（「ここで開く」の意図に素直）。
         let mut sessions: Vec<Session> = Vec::new();
+        let mut open_errors: Vec<String> = Vec::new();
         if let Launch::Cwd(path) = &launch {
             // タブ名はフォルダ名（末尾要素）にする。取れなければ既定シェル名にフォールバック。
             let title = std::path::Path::new(path)
@@ -165,13 +166,17 @@ impl App {
                 .and_then(|s| s.to_str())
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("{} 1", shells[default_shell].short));
-            let mut s = Session::spawn(&cc.egui_ctx, title, &shells[default_shell], path);
-            s.bg = default_bg;
-            s.accent = default_accent;
-            sessions.push(s);
+            match Session::spawn(&cc.egui_ctx, title, &shells[default_shell], path) {
+                Ok(mut s) => {
+                    s.bg = default_bg;
+                    s.accent = default_accent;
+                    sessions.push(s);
+                }
+                Err(e) => open_errors.push(e),
+            }
         } else if let Launch::RunScript(path) = &launch {
             // --run：スクリプトを、そのフォルダで実行するタブ1枚（起動タブ定義は無視）。
-            sessions.push(spawn_script_session(
+            match spawn_script_session(
                 &cc.egui_ctx,
                 path,
                 &shells,
@@ -179,7 +184,10 @@ impl App {
                 &script_runner,
                 default_bg,
                 default_accent,
-            ));
+            ) {
+                Ok(s) => sessions.push(s),
+                Err(e) => open_errors.push(e),
+            }
         } else if let Launch::Tab { spec, .. } = &launch {
             // --tab（本体不在 or --new-window）：そのタブ1枚だけ開く（起動タブ定義は無視）。
             // 深度スタンプは「呼び出し元+1」。この新プロセス自体が呼び出し元の子なので、
@@ -202,21 +210,29 @@ impl App {
                 TAB_DEPTH_ENV.to_string(),
                 (current_tab_depth() + 1).to_string(),
             )];
-            let mut s = Session::spawn_with_env(&cc.egui_ctx, name, &shells[si], &cwd, &env);
-            s.bg = color_from_hex(&spec.bg).unwrap_or(default_bg);
-            s.accent = color_from_hex(&spec.accent).unwrap_or(default_accent);
-            s.send_commands_paced(spec.commands.clone(), startup_quiet_ms, startup_max_wait_ms);
-            sessions.push(s);
+            match Session::spawn_with_env(&cc.egui_ctx, name, &shells[si], &cwd, &env) {
+                Ok(mut s) => {
+                    s.bg = color_from_hex(&spec.bg).unwrap_or(default_bg);
+                    s.accent = color_from_hex(&spec.accent).unwrap_or(default_accent);
+                    s.send_commands_paced(spec.commands.clone(), startup_quiet_ms, startup_max_wait_ms);
+                    sessions.push(s);
+                }
+                Err(e) => open_errors.push(e),
+            }
         } else if startup.is_empty() {
-            let mut s = Session::spawn(
+            match Session::spawn(
                 &cc.egui_ctx,
                 format!("{} 1", shells[default_shell].short),
                 &shells[default_shell],
                 &default_cwd,
-            );
-            s.bg = default_bg;
-            s.accent = default_accent;
-            sessions.push(s);
+            ) {
+                Ok(mut s) => {
+                    s.bg = default_bg;
+                    s.accent = default_accent;
+                    sessions.push(s);
+                }
+                Err(e) => open_errors.push(e),
+            }
         } else {
             for (n, entry) in startup.iter().enumerate() {
                 // エントリをタブ定義へ解決する。プリセット参照は presets から name で引く。
@@ -254,7 +270,13 @@ impl App {
                 };
                 let bg = color_from_hex(&spec.bg).unwrap_or(default_bg);
                 let accent = color_from_hex(&spec.accent).unwrap_or(default_accent);
-                let mut s = Session::spawn(&cc.egui_ctx, name, &shells[si], &cwd);
+                let mut s = match Session::spawn(&cc.egui_ctx, name, &shells[si], &cwd) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        open_errors.push(e);
+                        continue;
+                    }
+                };
                 s.bg = bg;
                 s.accent = accent;
                 // 出力が静まってから次を送る（claude 等の TUI にも投入できるように）。
@@ -303,7 +325,14 @@ impl App {
             preset_color_open: None,
             startup_pick_open: None,
             card_drag: None,
-            toast: None,
+            toast: match open_errors.as_slice() {
+                [] => None,
+                [e] => Some((format!("タブを開けませんでした: {e}"), std::time::Instant::now())),
+                [e, ..] => Some((
+                    format!("{} 個のタブを開けませんでした（1つ目: {e}）", open_errors.len()),
+                    std::time::Instant::now(),
+                )),
+            },
             // 受け口の生成に成功した（＝このプロセスが本体の）ときだけ Some。
             ipc_rx: ipc_start_server(&cc.egui_ctx),
             titlebar_last_dark: None,
@@ -321,7 +350,10 @@ impl App {
             .and_then(|s| s.to_str())
             .map(str::to_string)
             .unwrap_or_else(|| format!("{} {}", spec.short, id));
-        let mut sess = Session::spawn(ctx, title, &spec, dir);
+        let mut sess = match Session::spawn(ctx, title, &spec, dir) {
+            Ok(s) => s,
+            Err(e) => return self.tab_open_failed(e),
+        };
         sess.bg = self.default_bg;
         sess.accent = self.default_accent;
         self.sessions.push(sess);
@@ -330,7 +362,7 @@ impl App {
 
     // スクリプト（.ps1/.bat/.cmd）を、そのファイルのあるフォルダで実行するタブを開く。
     pub(crate) fn open_script_tab(&mut self, ctx: &egui::Context, path: &str) {
-        let sess = spawn_script_session(
+        let sess = match spawn_script_session(
             ctx,
             path,
             &self.shells,
@@ -338,10 +370,17 @@ impl App {
             &self.script_runner,
             self.default_bg,
             self.default_accent,
-        );
+        ) {
+            Ok(s) => s,
+            Err(e) => return self.tab_open_failed(e),
+        };
         self.next_id += 1;
         self.sessions.push(sess);
         self.active = self.sessions.len() - 1;
+    }
+
+    fn tab_open_failed(&mut self, e: String) {
+        self.show_toast(format!("タブを開けませんでした: {e}"));
     }
 
     // 一時通知を出す（数秒で自動的に消える）。
@@ -460,7 +499,10 @@ impl App {
         } else {
             spec.name.clone()
         };
-        let mut sess = Session::spawn_with_env(ctx, name, &self.shells[si], &cwd, extra_env);
+        let mut sess = match Session::spawn_with_env(ctx, name, &self.shells[si], &cwd, extra_env) {
+            Ok(s) => s,
+            Err(e) => return self.tab_open_failed(e),
+        };
         sess.bg = color_from_hex(&spec.bg).unwrap_or(self.default_bg);
         sess.accent = color_from_hex(&spec.accent).unwrap_or(self.default_accent);
         sess.send_commands_paced(
@@ -1610,16 +1652,20 @@ impl eframe::App for App {
                                     let cwd = self.default_cwd.clone();
                                     let id = self.next_id;
                                     self.next_id += 1;
-                                    let mut sess = Session::spawn(
+                                    match Session::spawn(
                                         &ctx,
                                         format!("{} {}", spec.short, id),
                                         &spec,
                                         &cwd,
-                                    );
-                                    sess.bg = self.default_bg;
-                                    sess.accent = self.default_accent;
-                                    self.sessions.push(sess);
-                                    self.active = self.sessions.len() - 1;
+                                    ) {
+                                        Ok(mut sess) => {
+                                            sess.bg = self.default_bg;
+                                            sess.accent = self.default_accent;
+                                            self.sessions.push(sess);
+                                            self.active = self.sessions.len() - 1;
+                                        }
+                                        Err(e) => self.tab_open_failed(e),
+                                    }
                                 }
                                 if !self.presets.is_empty() {
                                     ui.separator();
@@ -1705,9 +1751,10 @@ impl eframe::App for App {
         // 入力・スクロールはアクティブなセッションにのみ流す（設定ページ表示中は止める）。
         let active_idx = self.active;
         if !block_input {
-            let active = &mut self.sessions[active_idx];
-            if active.handle_input(&ctx) {
-                active.scroll_to_bottom();
+            if let Some(active) = self.sessions.get_mut(active_idx) {
+                if active.handle_input(&ctx) {
+                    active.scroll_to_bottom();
+                }
             }
         }
 
@@ -1721,6 +1768,17 @@ impl eframe::App for App {
                 )
                 .show(ui, |ui| {
                     self.settings_page(ui, &ctx);
+                });
+        } else if self.sessions.is_empty() {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE.fill(DEFAULT_BG))
+                .show(ui, |ui| {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            egui::RichText::new("開いているタブがありません。＋ から新しいタブを開いてください。")
+                                .color(TAB_TEXT),
+                        );
+                    });
                 });
         } else {
             // body の背景もアクティブセッションの bg にする（タブと地続き＋色分け）
