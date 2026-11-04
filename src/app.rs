@@ -159,6 +159,8 @@ impl App {
         // 起動タブ定義を無視してそのフォルダで1枚だけ開く（「ここで開く」の意図に素直）。
         let mut sessions: Vec<Session> = Vec::new();
         let mut open_errors: Vec<String> = Vec::new();
+        let mut rec_errors: Vec<String> = Vec::new();
+        let cast_max_kb = log_settings.cast_max_kb;
         if let Launch::Cwd(path) = &launch {
             // タブ名はフォルダ名（末尾要素）にする。取れなければ既定シェル名にフォールバック。
             let title = std::path::Path::new(path)
@@ -214,6 +216,11 @@ impl App {
                 Ok(mut s) => {
                     s.bg = color_from_hex(&spec.bg).unwrap_or(default_bg);
                     s.accent = color_from_hex(&spec.accent).unwrap_or(default_accent);
+                    if spec.record {
+                        if let Err(e) = s.set_recording(true, cast_max_kb) {
+                            rec_errors.push(e);
+                        }
+                    }
                     s.send_commands_paced(spec.commands.clone(), startup_quiet_ms, startup_max_wait_ms);
                     sessions.push(s);
                 }
@@ -279,6 +286,11 @@ impl App {
                 };
                 s.bg = bg;
                 s.accent = accent;
+                if spec.record {
+                    if let Err(e) = s.set_recording(true, cast_max_kb) {
+                        rec_errors.push(e);
+                    }
+                }
                 // 出力が静まってから次を送る（claude 等の TUI にも投入できるように）。
                 // 未解決参照はコマンドを持たないので送らない。
                 if !unresolved {
@@ -326,7 +338,9 @@ impl App {
             startup_pick_open: None,
             card_drag: None,
             toast: match open_errors.as_slice() {
-                [] => None,
+                [] => rec_errors
+                    .first()
+                    .map(|e| (format!("画面の記録を始められませんでした: {e}"), std::time::Instant::now())),
                 [e] => Some((format!("タブを開けませんでした: {e}"), std::time::Instant::now())),
                 [e, ..] => Some((
                     format!("{} 個のタブを開けませんでした（1つ目: {e}）", open_errors.len()),
@@ -505,6 +519,11 @@ impl App {
         };
         sess.bg = color_from_hex(&spec.bg).unwrap_or(self.default_bg);
         sess.accent = color_from_hex(&spec.accent).unwrap_or(self.default_accent);
+        if spec.record {
+            if let Err(e) = sess.set_recording(true, self.log_settings.cast_max_kb) {
+                self.show_toast(format!("画面の記録を始められませんでした: {e}"));
+            }
+        }
         sess.send_commands_paced(
             spec.commands_from_buf(),
             self.startup_quiet_ms,

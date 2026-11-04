@@ -29,6 +29,8 @@ pub(crate) struct TabSpec {
     pub(crate) bg: String, // "#RRGGBB"
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) accent: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) record: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) commands: Vec<String>, // spawn 後に pty へ各行＋Enter で流す
     // GUI 編集用バッファ：commands を改行区切りの複数行テキストとして編集する。
@@ -140,6 +142,25 @@ mod config_tests {
         let back: Settings = toml::from_str(&text).expect("deserialize");
         assert!(back.startup[0].is_preset(), "unselected preset is still preset mode");
         assert!(back.startup[0].preset.is_empty());
+    }
+
+    #[test]
+    fn record_flag_roundtrip() {
+        let s = Settings {
+            presets: vec![
+                TabSpec { name: "on".into(), record: true, ..Default::default() },
+                TabSpec { name: "off".into(), ..Default::default() },
+            ],
+            startup_quiet_ms: default_startup_quiet_ms(),
+            startup_max_wait_ms: default_startup_max_wait_ms(),
+            ..Default::default()
+        };
+        let text = toml::to_string_pretty(&s).expect("serialize");
+        assert_eq!(text.matches("record = true").count(), 1, "{text}");
+        assert!(!text.contains("record = false"), "{text}");
+        let back: Settings = toml::from_str(&text).expect("deserialize");
+        assert!(back.presets[0].record);
+        assert!(!back.presets[1].record);
     }
 
     // 手編集で use_preset 無し（=false）かつ preset 値ありは、マニュアル扱い＝preset を無視する。

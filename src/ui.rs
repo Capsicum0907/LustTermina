@@ -241,6 +241,7 @@ pub(crate) fn tab_spec_of(s: &Session) -> TabSpec {
         cwd: s.cwd.clone(),
         bg: color_to_hex(s.bg),
         accent: color_to_hex(s.accent),
+        record: s.is_recording(),
         commands: Vec::new(),
         ..Default::default()
     }
@@ -832,6 +833,8 @@ pub(crate) fn tab_spec_card(
                         .desired_rows(2)
                         .desired_width(f32::INFINITY),
                 );
+                ui.add_space(2.0);
+                ui.checkbox(&mut spec.record, "画面を記録する");
             }
         });
     // カード矩形を記録し、端の余白にドラッグハンドル（点）＋アクセントバーを描く。
