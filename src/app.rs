@@ -1260,6 +1260,10 @@ impl eframe::App for App {
             }
         }
 
+        for sess in &mut self.sessions {
+            sess.note_exit();
+        }
+
         // スクリプト実行タブ（close_on_exit）: 子プロセスの終了を監視する。
         // 正常終了(exit 0)なら閉じる（最後の1枚ならダブルクリック完結として窓ごと閉じる）。
         // 失敗(非0)や監視不能なら閉じずに出力を残す＝失敗を握り潰さない。

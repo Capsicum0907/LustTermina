@@ -2,7 +2,8 @@ use std::fmt::Arguments;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock, TryLockError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
 
@@ -12,6 +13,8 @@ use crate::winintegration::config_dir;
 const LOG_DIR: &str = "logs";
 const LOG_FILE: &str = "lust_termina.log";
 const ROTATED_SUFFIX: &str = ".1";
+const TAB_DIR: &str = "tabs";
+const TAB_EXT: &str = "log";
 const OWN_CRATE: &str = env!("CARGO_CRATE_NAME");
 
 struct FileLogger {
@@ -23,9 +26,14 @@ struct FileLogger {
 }
 
 static LOGGER: OnceLock<FileLogger> = OnceLock::new();
+static TAB_SEQ: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn log_dir() -> Option<PathBuf> {
     Some(config_dir()?.join(LOG_DIR))
+}
+
+fn tab_dir() -> Option<PathBuf> {
+    Some(log_dir()?.join(TAB_DIR))
 }
 
 fn parse_level(s: &str, fallback: LevelFilter) -> LevelFilter {
@@ -60,6 +68,26 @@ pub(crate) fn init(settings: &LogSettings) {
         }
     }
     install_panic_hook();
+    prune_tab_logs(settings.tab_keep);
+}
+
+fn prune_tab_logs(keep: usize) {
+    let Some(dir) = tab_dir() else { return };
+    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == TAB_EXT))
+        .collect();
+    if files.len() <= keep {
+        return;
+    }
+    files.sort();
+    let excess = files.len() - keep;
+    for old in &files[..excess] {
+        if let Err(e) = std::fs::remove_file(old) {
+            log::warn!("could not prune tab log {}: {e}", old.display());
+        }
+    }
 }
 
 pub(crate) fn close() {
@@ -70,6 +98,14 @@ pub(crate) fn close() {
         };
         *guard = None;
     }
+}
+
+fn file_stamp() -> String {
+    let t = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    format!(
+        "{:04}{:02}{:02}-{:02}{:02}{:02}",
+        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
+    )
 }
 
 fn timestamp() -> String {
@@ -199,4 +235,53 @@ fn install_panic_hook() {
         }
         previous(info);
     }));
+}
+
+pub(crate) struct TabLog {
+    id: u64,
+    file: Mutex<Option<File>>,
+    write_failed: AtomicBool,
+}
+
+impl TabLog {
+    pub(crate) fn open() -> Arc<TabLog> {
+        let id = TAB_SEQ.fetch_add(1, Ordering::Relaxed);
+        let file = tab_dir().and_then(|dir| {
+            std::fs::create_dir_all(&dir).ok()?;
+            let name = format!("{}_{}_{}.{}", file_stamp(), std::process::id(), id, TAB_EXT);
+            open_append(&dir.join(name))
+        });
+        Arc::new(TabLog {
+            id,
+            file: Mutex::new(file),
+            write_failed: AtomicBool::new(false),
+        })
+    }
+
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub(crate) fn event(&self, level: Level, args: Arguments) {
+        let enabled = LOGGER
+            .get()
+            .is_some_and(|l| level <= l.own);
+        if !enabled {
+            return;
+        }
+        let target = format!("tab#{}", self.id);
+        let line = format_line(level, &target, &args);
+        if let Ok(mut g) = self.file.lock() {
+            if let Some(f) = g.as_mut() {
+                let _ = f.write_all(line.as_bytes());
+            }
+        }
+        log::log!(target: "lust_termina::tab", level, "tab#{} {}", self.id, args);
+    }
+
+    pub(crate) fn write_error(&self, e: &std::io::Error) {
+        if !self.write_failed.swap(true, Ordering::Relaxed) {
+            self.event(Level::Warn, format_args!("write to pty failed (further failures not logged): {e}"));
+        }
+    }
 }

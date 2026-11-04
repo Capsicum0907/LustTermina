@@ -16,6 +16,8 @@ use alacritty_terminal::vte::ansi::{CursorShape, Processor};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use crate::color::*;
 use crate::shells::ShellSpec;
+use crate::logging::TabLog;
+use log::Level;
 
 // ---- グリッド寸法（alacritty の Dimensions を満たす最小実装）----
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -45,14 +47,16 @@ impl Dimensions for TermSize {
 #[derive(Clone)]
 pub(crate) struct EventProxy {
     pub(crate) writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    pub(crate) log: Arc<TabLog>,
 }
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
         if let Event::PtyWrite(text) = event {
             if let Ok(mut w) = self.writer.lock() {
-                let _ = w.write_all(text.as_bytes());
-                let _ = w.flush();
+                if let Err(e) = w.write_all(text.as_bytes()).and_then(|_| w.flush()) {
+                    self.log.write_error(&e);
+                }
             }
         }
     }
@@ -103,6 +107,8 @@ pub(crate) struct Session {
     // 通常の対話シェルは false（残す）。失敗終了(非0)時は出力を残すため閉じない（app 側で判定）。
     pub(crate) close_on_exit: bool,
     pub(crate) child: Box<dyn portable_pty::Child + Send + Sync>,
+    pub(crate) log: Arc<TabLog>,
+    pub(crate) exit_logged: bool,
 }
 
 impl Session {
@@ -119,6 +125,17 @@ impl Session {
         extra_env: &[(String, String)],
     ) -> Self {
         let init = TermSize { cols: 80, rows: 24 };
+        let log = TabLog::open();
+        log.event(
+            Level::Info,
+            format_args!(
+                "opening title={title:?} shell={} program={:?} args={:?} cwd={cwd:?} extra_env={:?}",
+                spec.short,
+                spec.program,
+                spec.args,
+                extra_env.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>()
+            ),
+        );
 
         // PTY を開いて pwsh を起動
         let pty_system = native_pty_system();
@@ -142,6 +159,7 @@ impl Session {
         }
         let child = pair.slave.spawn_command(cmd).expect("spawn shell failed");
         drop(pair.slave); // slave 側はもう要らない
+        log.event(Level::Info, format_args!("spawned pid={:?}", child.process_id()));
 
         let reader = pair.master.try_clone_reader().expect("clone reader failed");
         let writer = pair.master.take_writer().expect("take writer failed");
@@ -153,6 +171,7 @@ impl Session {
         // ターミナルのグリッド（書き戻し用プロキシを渡す）
         let proxy = EventProxy {
             writer: writer.clone(),
+            log: log.clone(),
         };
         let term = Term::new(Config::default(), &init, proxy);
         let term = Arc::new(Mutex::new(term));
@@ -166,13 +185,24 @@ impl Session {
             let ctx = ctx.clone();
             let last_output = last_output.clone();
             let mut reader = reader;
-            thread::spawn(move || {
+            let thread_log = log.clone();
+            let spawned = thread::Builder::new().name(format!("pty-reader-{}", log.id())).spawn(move || {
+                let log = thread_log;
                 let mut parser: Processor = Processor::new();
                 let mut buf = [0u8; 8192];
+                let mut total: u64 = 0;
                 loop {
                     match reader.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
+                        Ok(0) => {
+                            log.event(Level::Info, format_args!("pty output ended (EOF) after {total} bytes"));
+                            break;
+                        }
+                        Err(e) => {
+                            log.event(Level::Warn, format_args!("pty read failed after {total} bytes: {e}"));
+                            break;
+                        }
                         Ok(n) => {
+                            total += n as u64;
                             if let Ok(mut term) = term.lock() {
                                 parser.advance(&mut *term, &buf[..n]);
                             }
@@ -184,6 +214,9 @@ impl Session {
                     }
                 }
             });
+            if let Err(e) = spawned {
+                log.event(Level::Error, format_args!("could not start the pty reader thread: {e}"));
+            }
         }
 
         Self {
@@ -202,6 +235,8 @@ impl Session {
             last_output,
             close_on_exit: false,
             child,
+            log,
+            exit_logged: false,
         }
     }
 
@@ -216,6 +251,8 @@ impl Session {
         }
         let writer = self.writer.clone();
         let last_output = self.last_output.clone();
+        let log = self.log.clone();
+        log.event(Level::Info, format_args!("sending {} startup command(s)", commands.len()));
         thread::spawn(move || {
             let quiet = Duration::from_millis(quiet_ms);
             let max_wait = Duration::from_millis(max_wait_ms);
@@ -241,8 +278,9 @@ impl Session {
             };
             let write = |bytes: &[u8]| {
                 if let Ok(mut w) = writer.lock() {
-                    let _ = w.write_all(bytes);
-                    let _ = w.flush();
+                    if let Err(e) = w.write_all(bytes).and_then(|_| w.flush()) {
+                        log.write_error(&e);
+                    }
                 }
             };
             // まず初期プロンプト（シェル起動時の出力）が落ち着くのを待つ。
@@ -265,8 +303,26 @@ impl Session {
 
     pub(crate) fn send(&self, bytes: &[u8]) {
         if let Ok(mut w) = self.writer.lock() {
-            let _ = w.write_all(bytes);
-            let _ = w.flush();
+            if let Err(e) = w.write_all(bytes).and_then(|_| w.flush()) {
+                self.log.write_error(&e);
+            }
+        }
+    }
+
+    pub(crate) fn note_exit(&mut self) {
+        if self.exit_logged {
+            return;
+        }
+        match self.child.try_wait() {
+            Ok(None) => {}
+            Ok(Some(status)) => {
+                self.exit_logged = true;
+                self.log.event(Level::Info, format_args!("shell exited with code {}", status.exit_code()));
+            }
+            Err(e) => {
+                self.exit_logged = true;
+                self.log.event(Level::Warn, format_args!("cannot watch the shell process: {e}"));
+            }
         }
     }
 
@@ -430,12 +486,14 @@ impl Session {
             term.resize(new);
         }
         if let Ok(master) = self.master.lock() {
-            let _ = master.resize(PtySize {
+            if let Err(e) = master.resize(PtySize {
                 rows: new.rows as u16,
                 cols: new.cols as u16,
                 pixel_width: 0,
                 pixel_height: 0,
-            });
+            }) {
+                self.log.event(Level::Warn, format_args!("pty resize to {}x{} failed: {e}", new.cols, new.rows));
+            }
         }
     }
 
@@ -738,3 +796,10 @@ impl Session {
     }
 }
 
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.note_exit();
+        self.log.event(Level::Info, format_args!("tab closed (title={:?})", self.title));
+    }
+}
