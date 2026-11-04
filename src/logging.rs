@@ -285,3 +285,19 @@ impl TabLog {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_folder_can_be_deleted_while_a_log_is_open() {
+        let dir = std::env::temp_dir().join(format!("lust_termina_log_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join(LOG_FILE);
+        let mut f = open_append(&path).expect("open log");
+        f.write_all(b"line\n").expect("write");
+        std::fs::remove_dir_all(&dir).expect("remove while open");
+        assert!(!dir.exists());
+    }
+}
