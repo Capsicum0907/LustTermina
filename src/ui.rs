@@ -1206,3 +1206,34 @@ pub(crate) fn shell_list(
     }
     chosen
 }
+
+pub(crate) fn playback_bar(ui: &mut egui::Ui, ctl: &crate::playback::PlaybackCtl) {
+    use std::sync::atomic::Ordering;
+    let finished = ctl.finished.load(Ordering::Relaxed);
+    let paused = ctl.paused.load(Ordering::Relaxed);
+    let speed = ctl.speed.load(Ordering::Relaxed);
+    ui.horizontal(|ui| {
+        ui.add_space(crate::PAD);
+        if finished {
+            ui.label(egui::RichText::new("再生終了").color(TAB_TEXT));
+        } else {
+            let label = if paused { "再生" } else { "一時停止" };
+            if ui.button(label).clicked() {
+                ctl.paused.store(!paused, Ordering::Relaxed);
+            }
+            for s in crate::playback::SPEEDS {
+                if ui.selectable_label(speed == s, format!("{s}倍")).clicked() {
+                    ctl.speed.store(s, Ordering::Relaxed);
+                }
+            }
+            if ui.button("最後まで").clicked() {
+                ctl.skip.store(true, Ordering::Relaxed);
+                ctl.paused.store(false, Ordering::Relaxed);
+            }
+        }
+        let secs = ctl.played_ms.load(Ordering::Relaxed) / 1000;
+        ui.label(
+            egui::RichText::new(format!("{}:{:02}", secs / 60, secs % 60)).color(Color32::from_gray(150)),
+        );
+    });
+}

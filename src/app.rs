@@ -51,6 +51,7 @@ pub(crate) struct App {
     pub(crate) startup_quiet_ms: u64,   // 起動コマンド投入の静穏窓（config 可変、既定 STARTUP_QUIET_MS）
     pub(crate) startup_max_wait_ms: u64, // 同・待ち上限（config 可変、既定 STARTUP_MAX_WAIT_MS）
     pub(crate) log_settings: LogSettings,
+    pub(crate) playback_settings: PlaybackSettings,
     pub(crate) presets: Vec<TabSpec>,     // 型ライブラリ（再利用できるタブ定義。name が識別子）
     pub(crate) startup: Vec<StartupEntry>, // 起動時に開くタブ定義（空＝既定シェル1枚）
     pub(crate) script_runner: std::collections::BTreeMap<String, String>, // 拡張子→スクリプト実行シェル short
@@ -121,6 +122,7 @@ impl App {
         let mut startup_quiet_ms = STARTUP_QUIET_MS;
         let mut startup_max_wait_ms = STARTUP_MAX_WAIT_MS;
         let mut log_settings = LogSettings::default();
+        let mut playback_settings = PlaybackSettings::default();
         let mut presets: Vec<TabSpec> = Vec::new();
         let mut startup: Vec<StartupEntry> = Vec::new();
         let mut script_runner: std::collections::BTreeMap<String, String> = Default::default();
@@ -129,6 +131,7 @@ impl App {
             startup_quiet_ms = cfg.startup_quiet_ms;
             startup_max_wait_ms = cfg.startup_max_wait_ms;
             log_settings = cfg.log.clone();
+            playback_settings = cfg.playback.clone();
             if let Some(i) = shells.iter().position(|s| s.short == cfg.default_shell) {
                 default_shell = i;
             }
@@ -327,6 +330,7 @@ impl App {
             startup_quiet_ms,
             startup_max_wait_ms,
             log_settings,
+            playback_settings,
             presets,
             startup,
             script_runner,
@@ -393,6 +397,18 @@ impl App {
         self.active = self.sessions.len() - 1;
     }
 
+    pub(crate) fn open_playback_tab(&mut self, ctx: &egui::Context, path: &std::path::Path) {
+        let idle = std::time::Duration::from_millis(self.playback_settings.idle_limit_ms);
+        match Session::open_playback(ctx, path, idle) {
+            Ok(sess) => {
+                self.next_id += 1;
+                self.sessions.push(sess);
+                self.active = self.sessions.len() - 1;
+            }
+            Err(e) => self.show_toast(format!("記録を開けませんでした: {e}")),
+        }
+    }
+
     fn tab_open_failed(&mut self, e: String) {
         self.show_toast(format!("タブを開けませんでした: {e}"));
     }
@@ -418,6 +434,7 @@ impl App {
             startup_quiet_ms: self.startup_quiet_ms,
             startup_max_wait_ms: self.startup_max_wait_ms,
             log: self.log_settings.clone(),
+            playback: self.playback_settings.clone(),
             // 保存時に commands_buf（複数行テキスト）→ commands（行配列、空行除去）へ確定。
             presets: self
                 .presets
@@ -470,6 +487,7 @@ impl App {
         self.startup_quiet_ms = STARTUP_QUIET_MS;
         self.startup_max_wait_ms = STARTUP_MAX_WAIT_MS;
         self.log_settings = LogSettings::default();
+        self.playback_settings = PlaybackSettings::default();
         self.presets.clear();
         self.startup.clear();
         self.script_runner.clear();
@@ -1334,7 +1352,10 @@ impl eframe::App for App {
             let mut i = 0;
             while i < self.sessions.len() {
                 if self.sessions[i].close_on_exit {
-                    let res = self.sessions[i].child.try_wait();
+                    let res = match self.sessions[i].child.as_mut() {
+                        Some(child) => child.try_wait(),
+                        None => Ok(None),
+                    };
                     match res {
                         Ok(Some(status)) => {
                             if status.success() {
@@ -1371,7 +1392,9 @@ impl eframe::App for App {
         let dropped: Vec<std::path::PathBuf> =
             ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
         for path in dropped {
-            if path.is_dir() {
+            if crate::playback::is_cast_path(&path) {
+                self.open_playback_tab(&ctx, &path);
+            } else if path.is_dir() {
                 self.open_dir_tab(&ctx, &path.to_string_lossy());
             } else if is_script_path(&path) {
                 self.open_script_tab(&ctx, &path.to_string_lossy());
@@ -1390,7 +1413,7 @@ impl eframe::App for App {
             painter.text(
                 screen.center(),
                 egui::Align2::CENTER_CENTER,
-                "ドロップで開く（スクリプトは実行）",
+                "ドロップで開く（スクリプトは実行・記録 .cast は再生）",
                 FontId::proportional(20.0),
                 TAB_TEXT_ACTIVE,
             );
@@ -1815,6 +1838,9 @@ impl eframe::App for App {
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE.fill(body_bg))
                 .show(ui, |ui| {
+                    if let Some(ctl) = self.sessions[active_idx].playback.clone() {
+                        playback_bar(ui, &ctl);
+                    }
                     self.sessions[active_idx]
                         .draw(ui, &ctx, &font, cell_w, cell_h, !block_input);
                 });

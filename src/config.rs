@@ -234,6 +234,20 @@ pub(crate) struct Settings {
     pub(crate) startup_max_wait_ms: u64,
     #[serde(default)]
     pub(crate) log: LogSettings,
+    #[serde(default)]
+    pub(crate) playback: PlaybackSettings,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[serde(default)]
+pub(crate) struct PlaybackSettings {
+    pub(crate) idle_limit_ms: u64,
+}
+
+impl Default for PlaybackSettings {
+    fn default() -> Self {
+        Self { idle_limit_ms: 2000 }
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]

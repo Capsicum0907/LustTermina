@@ -19,6 +19,7 @@ mod icons;
 mod input;
 mod ipc;
 mod logging;
+mod playback;
 mod recording;
 mod session;
 mod shells;

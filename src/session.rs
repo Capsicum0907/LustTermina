@@ -18,6 +18,7 @@ use crate::color::*;
 use crate::shells::ShellSpec;
 use crate::logging::TabLog;
 use crate::recording::CastRecorder;
+use crate::playback::{PlaybackCtl, Player};
 use log::Level;
 
 // ---- グリッド寸法（alacritty の Dimensions を満たす最小実装）----
@@ -87,7 +88,7 @@ pub(crate) fn default_startup_max_wait_ms() -> u64 {
 pub(crate) struct Session {
     pub(crate) term: Arc<Mutex<Term<EventProxy>>>,
     pub(crate) writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    pub(crate) master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    pub(crate) master: Option<Arc<Mutex<Box<dyn MasterPty + Send>>>>,
     pub(crate) size: TermSize,
     pub(crate) scroll_accum: f32, // ホイールの端数（行）を貯める
     pub(crate) title: String,
@@ -107,7 +108,8 @@ pub(crate) struct Session {
     // スクリプト実行タブ用: 子プロセスが正常終了したらこのタブを自動で閉じる（run-and-close）。
     // 通常の対話シェルは false（残す）。失敗終了(非0)時は出力を残すため閉じない（app 側で判定）。
     pub(crate) close_on_exit: bool,
-    pub(crate) child: Box<dyn portable_pty::Child + Send + Sync>,
+    pub(crate) child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    pub(crate) playback: Option<Arc<PlaybackCtl>>,
     pub(crate) log: Arc<TabLog>,
     pub(crate) exit_logged: bool,
     logged_props: Option<(String, Color32, Color32)>,
@@ -242,7 +244,7 @@ impl Session {
         Ok(Self {
             term,
             writer,
-            master: Arc::new(Mutex::new(master)),
+            master: Some(Arc::new(Mutex::new(master))),
             size: init,
             scroll_accum: 0.0,
             title,
@@ -254,7 +256,8 @@ impl Session {
             last_mouse_cell: None,
             last_output,
             close_on_exit: false,
-            child,
+            child: Some(child),
+            playback: None,
             log,
             exit_logged: false,
             logged_props: None,
@@ -361,6 +364,60 @@ impl Session {
         }
     }
 
+    pub(crate) fn open_playback(
+        ctx: &egui::Context,
+        path: &std::path::Path,
+        idle_limit: Duration,
+    ) -> Result<Self, String> {
+        let log = TabLog::open();
+        let files = crate::playback::cast_parts(path);
+        log.event(Level::Info, format_args!("opening playback of {} ({} file(s))", path.display(), files.len()));
+        let first = files
+            .first()
+            .ok_or_else(|| spawn_failed(&log, "no recording found", path.display()))?;
+        let size = crate::playback::read_header_size(first).map_err(|e| spawn_failed(&log, "cannot read recording", e))?;
+        let title = first
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| format!("▶ {s}"))
+            .unwrap_or_else(|| "▶".to_string());
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(Box::new(std::io::sink())));
+        let proxy = EventProxy { writer: writer.clone(), log: log.clone() };
+        let term = Arc::new(Mutex::new(Term::new(Config::default(), &size, proxy)));
+        let ctl = Player {
+            files,
+            term: term.clone(),
+            ctx: ctx.clone(),
+            log: log.clone(),
+            idle_limit,
+        }
+        .start()
+        .map_err(|e| spawn_failed(&log, "cannot play", e))?;
+        Ok(Self {
+            term,
+            writer,
+            master: None,
+            size,
+            scroll_accum: 0.0,
+            title,
+            bg: DEFAULT_BG,
+            accent: ACCENT_GREEN,
+            shell_short: String::new(),
+            cwd: String::new(),
+            preedit: String::new(),
+            last_mouse_cell: None,
+            last_output: Arc::new(Mutex::new(Instant::now())),
+            close_on_exit: false,
+            child: None,
+            playback: Some(ctl),
+            log,
+            exit_logged: true,
+            logged_props: None,
+            recording: Arc::new(Mutex::new(None)),
+            rec_count: 0,
+        })
+    }
+
     pub(crate) fn note_props(&mut self) {
         let hex = crate::config::color_to_hex;
         let now = (self.title.clone(), self.bg, self.accent);
@@ -389,7 +446,8 @@ impl Session {
         if self.exit_logged {
             return;
         }
-        match self.child.try_wait() {
+        let Some(child) = self.child.as_mut() else { return };
+        match child.try_wait() {
             Ok(None) => {}
             Ok(Some(status)) => {
                 self.exit_logged = true;
@@ -554,14 +612,14 @@ impl Session {
             cols: cols.max(1),
             rows: rows.max(1),
         };
-        if new == self.size {
+        if new == self.size || self.playback.is_some() {
             return;
         }
         self.size = new;
         if let Ok(mut term) = self.term.lock() {
             term.resize(new);
         }
-        if let Ok(master) = self.master.lock() {
+        if let Some(master) = self.master.as_ref().and_then(|m| m.lock().ok()) {
             if let Err(e) = master.resize(PtySize {
                 rows: new.rows as u16,
                 cols: new.cols as u16,
@@ -901,6 +959,9 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        if let Some(ctl) = &self.playback {
+            ctl.stop();
+        }
         self.note_exit();
         self.note_props();
         self.log.event(Level::Info, format_args!("tab closed (title={:?})", self.title));
