@@ -21,7 +21,14 @@ remap を付けて作る。
 
 このスクリプトは `RUSTFLAGS="--remap-path-prefix=$env:USERPROFILE=C:\Users\user -C target-feature=+crt-static"`
 を付けて `cargo build --release` し、生成した `target/release/lust_termina.exe` に実ユーザー名が残って
-いないか自己検査する（残っていれば失敗して停止＝取りこぼしを防ぐ）。最後に、配布用の版付きファイル
+いないか自己検査する（残っていれば失敗して停止＝取りこぼしを防ぐ）。
+
+ホームの置き換えだけでは、依存クレートがビルド時に生成したファイルの場所（`target/release/build/...`）から
+リポジトリまでの道筋（ホーム以下のフォルダ構成）が残る（v0.5.0 の準備中に glutin_wgl_sys で実際に
+見つかった）。そのためリポジトリのフォルダ自体も `lust_termina` に置き換える（区切りが `\`・`/`・混在の
+3形）。自己検査も、ユーザー名・コンピューター名・リポジトリまでの道筋を、UTF-8 と UTF-16 の両方で探す。
+
+最後に、配布用の版付きファイル
 `target/release/LustTermina-v<version>-windows-x64.exe` を生成する（版番号は Cargo.toml が唯一の正。
 スクラブ済み exe のバイト同一コピーなので、これをそのまま公開に使う）。
 
