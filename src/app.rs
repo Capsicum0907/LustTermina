@@ -1443,6 +1443,7 @@ impl eframe::App for App {
         let mut to_close: Option<usize> = None;
         let mut to_add_startup: Option<usize> = None;
         let mut to_toggle_record: Option<usize> = None;
+        let mut to_play: Option<std::path::PathBuf> = None;
         // 設定ページ表示中はタブパネルを隠し、設定を窓いっぱいに表示する。
         if !self.settings_open {
         let tab_panel = if self.panel_right {
@@ -1561,7 +1562,7 @@ impl eframe::App for App {
                                     rect
                                 } else {
                                     let selected = i == self.active;
-                                    let (resp, close, add_startup, toggle_record) = draw_tab(
+                                    let (resp, menu) = draw_tab(
                                         ui,
                                         i,
                                         &mut self.sessions[i],
@@ -1586,14 +1587,17 @@ impl eframe::App for App {
                                     } else if resp.clicked() {
                                         self.active = i;
                                     }
-                                    if close {
+                                    if menu.close {
                                         to_close = Some(i);
                                     }
-                                    if add_startup {
+                                    if menu.add_startup {
                                         to_add_startup = Some(i);
                                     }
-                                    if toggle_record {
+                                    if menu.toggle_record {
                                         to_toggle_record = Some(i);
+                                    }
+                                    if menu.play.is_some() {
+                                        to_play = menu.play;
                                     }
                                     resp.rect
                                 }
@@ -1761,6 +1765,9 @@ impl eframe::App for App {
 
         // 右クリック「起動タブに追加」：このタブを起動タブ定義へ追加し即保存。
         // 完全に同一の定義が既にあれば重複追加しない。
+        if let Some(path) = to_play {
+            self.open_playback_tab(&ctx, &path);
+        }
         if let Some(i) = to_toggle_record {
             let max_kb = self.log_settings.cast_max_kb;
             if let Some(s) = self.sessions.get_mut(i) {

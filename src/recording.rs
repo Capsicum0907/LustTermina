@@ -134,6 +134,29 @@ impl CastRecorder {
 
 }
 
+pub(crate) fn recordings_of(stem: &str) -> Vec<(u32, PathBuf)> {
+    match crate::logging::tab_dir() {
+        Some(dir) => recordings_in(&dir, stem),
+        None => Vec::new(),
+    }
+}
+
+fn recordings_in(dir: &std::path::Path, stem: &str) -> Vec<(u32, PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let prefix = format!("{stem}_rec");
+    let suffix = format!(".{CAST_EXT}");
+    let mut found: Vec<(u32, PathBuf)> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter_map(|p| {
+            let name = p.file_name()?.to_str()?;
+            let n = name.strip_prefix(&prefix)?.strip_suffix(&suffix)?.parse().ok()?;
+            Some((n, p))
+        })
+        .collect();
+    found.sort();
+    found
+}
+
 fn decode_utf8(pending: &mut Vec<u8>, bytes: &[u8]) -> String {
     let mut buf = std::mem::take(pending);
     buf.extend_from_slice(bytes);
@@ -197,6 +220,18 @@ fn json_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lists_first_parts_of_a_tab_in_order() {
+        let dir = std::env::temp_dir().join(format!("lust_termina_recs_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        for name in ["t_1_rec2.cast", "t_1_rec10.cast", "t_1_rec1.cast", "t_1_rec1_part2.cast", "t_12_rec1.cast", "t_1.log"] {
+            std::fs::write(dir.join(name), "").expect("write");
+        }
+        let got: Vec<u32> = recordings_in(&dir, "t_1").into_iter().map(|(n, _)| n).collect();
+        assert_eq!(got, vec![1, 2, 10]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn keeps_a_character_split_across_reads() {

@@ -636,6 +636,10 @@ impl Session {
         }
     }
 
+    pub(crate) fn recordings(&self) -> Vec<(u32, std::path::PathBuf)> {
+        crate::recording::recordings_of(self.log.stem())
+    }
+
     pub(crate) fn playback_grid(&self) -> Option<(usize, usize)> {
         self.playback.as_ref()?;
         let term = self.term.lock().ok()?;
