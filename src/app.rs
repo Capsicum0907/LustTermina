@@ -1400,6 +1400,7 @@ impl eframe::App for App {
         // 縦タブ（サイドパネル）。1タブ = 1セッション。設定で左右どちらにも置ける。
         let mut to_close: Option<usize> = None;
         let mut to_add_startup: Option<usize> = None;
+        let mut to_toggle_record: Option<usize> = None;
         // 設定ページ表示中はタブパネルを隠し、設定を窓いっぱいに表示する。
         if !self.settings_open {
         let tab_panel = if self.panel_right {
@@ -1518,7 +1519,7 @@ impl eframe::App for App {
                                     rect
                                 } else {
                                     let selected = i == self.active;
-                                    let (resp, close, add_startup) = draw_tab(
+                                    let (resp, close, add_startup, toggle_record) = draw_tab(
                                         ui,
                                         i,
                                         &mut self.sessions[i],
@@ -1548,6 +1549,9 @@ impl eframe::App for App {
                                     }
                                     if add_startup {
                                         to_add_startup = Some(i);
+                                    }
+                                    if toggle_record {
+                                        to_toggle_record = Some(i);
                                     }
                                     resp.rect
                                 }
@@ -1715,6 +1719,15 @@ impl eframe::App for App {
 
         // 右クリック「起動タブに追加」：このタブを起動タブ定義へ追加し即保存。
         // 完全に同一の定義が既にあれば重複追加しない。
+        if let Some(i) = to_toggle_record {
+            let max_kb = self.log_settings.cast_max_kb;
+            if let Some(s) = self.sessions.get_mut(i) {
+                let on = !s.is_recording();
+                if let Err(e) = s.set_recording(on, max_kb) {
+                    self.show_toast(format!("画面の記録を始められませんでした: {e}"));
+                }
+            }
+        }
         if let Some(i) = to_add_startup {
             if let Some(s) = self.sessions.get(i) {
                 let spec = tab_spec_of(s);

@@ -17,6 +17,7 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use crate::color::*;
 use crate::shells::ShellSpec;
 use crate::logging::TabLog;
+use crate::recording::CastRecorder;
 use log::Level;
 
 // ---- グリッド寸法（alacritty の Dimensions を満たす最小実装）----
@@ -110,6 +111,8 @@ pub(crate) struct Session {
     pub(crate) log: Arc<TabLog>,
     pub(crate) exit_logged: bool,
     logged_props: Option<(String, Color32, Color32)>,
+    recording: Arc<Mutex<Option<CastRecorder>>>,
+    rec_count: u32,
 }
 
 impl Session {
@@ -188,12 +191,14 @@ impl Session {
 
         // 起動コマンド投入ペーサ用：最後に PTY 出力が来た時刻。
         let last_output = Arc::new(Mutex::new(Instant::now()));
+        let recording: Arc<Mutex<Option<CastRecorder>>> = Arc::new(Mutex::new(None));
 
         // PTY 読み取りスレッド: bytes → VT パーサ → グリッド更新 → 再描画要求
         {
             let term = term.clone();
             let ctx = ctx.clone();
             let last_output = last_output.clone();
+            let recording = recording.clone();
             let mut reader = reader;
             let thread_log = log.clone();
             let spawned = thread::Builder::new().name(format!("pty-reader-{}", log.id())).spawn(move || {
@@ -215,6 +220,11 @@ impl Session {
                             total += n as u64;
                             if let Ok(mut term) = term.lock() {
                                 parser.advance(&mut *term, &buf[..n]);
+                            }
+                            if let Ok(mut rec) = recording.lock() {
+                                if let Some(rec) = rec.as_mut() {
+                                    rec.output(&buf[..n]);
+                                }
                             }
                             if let Ok(mut t) = last_output.lock() {
                                 *t = Instant::now();
@@ -248,6 +258,8 @@ impl Session {
             log,
             exit_logged: false,
             logged_props: None,
+            recording,
+            rec_count: 0,
         })
     }
 
@@ -559,6 +571,32 @@ impl Session {
                 self.log.event(Level::Warn, format_args!("pty resize to {}x{} failed: {e}", new.cols, new.rows));
             }
         }
+        if let Ok(mut rec) = self.recording.lock() {
+            if let Some(rec) = rec.as_mut() {
+                rec.resize(new.cols, new.rows);
+            }
+        }
+    }
+
+    pub(crate) fn is_recording(&self) -> bool {
+        self.recording.lock().map(|r| r.is_some()).unwrap_or(false)
+    }
+
+    pub(crate) fn set_recording(&mut self, on: bool, max_kb: u64) -> Result<(), String> {
+        let mut slot = self.recording.lock().map_err(|_| "recording lock poisoned".to_string())?;
+        match (on, slot.is_some()) {
+            (true, false) => {
+                self.rec_count += 1;
+                let rec = CastRecorder::start(self.log.clone(), self.rec_count, self.size.cols, self.size.rows, max_kb)
+                    .inspect_err(|e| {
+                        self.log.event(Level::Error, format_args!("recording could not start: {e}"));
+                    })?;
+                *slot = Some(rec);
+            }
+            (false, true) => *slot = None,
+            _ => {}
+        }
+        Ok(())
     }
 
     // 中央領域にこのセッションのグリッドを描画する

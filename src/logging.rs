@@ -32,7 +32,7 @@ pub(crate) fn log_dir() -> Option<PathBuf> {
     Some(config_dir()?.join(LOG_DIR))
 }
 
-fn tab_dir() -> Option<PathBuf> {
+pub(crate) fn tab_dir() -> Option<PathBuf> {
     Some(log_dir()?.join(TAB_DIR))
 }
 
@@ -68,15 +68,16 @@ pub(crate) fn init(settings: &LogSettings) {
         }
     }
     install_panic_hook();
-    prune_tab_logs(settings.tab_keep);
+    prune_tab_files(TAB_EXT, settings.tab_keep);
+    prune_tab_files(crate::recording::CAST_EXT, settings.cast_keep);
 }
 
-fn prune_tab_logs(keep: usize) {
+fn prune_tab_files(ext: &str, keep: usize) {
     let Some(dir) = tab_dir() else { return };
     let Ok(entries) = std::fs::read_dir(&dir) else { return };
     let mut files: Vec<PathBuf> = entries
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == TAB_EXT))
+        .filter(|p| p.extension().is_some_and(|x| x == ext))
         .collect();
     if files.len() <= keep {
         return;
@@ -239,6 +240,7 @@ fn install_panic_hook() {
 
 pub(crate) struct TabLog {
     id: u64,
+    stem: String,
     file: Mutex<Option<File>>,
     write_failed: AtomicBool,
 }
@@ -246,13 +248,14 @@ pub(crate) struct TabLog {
 impl TabLog {
     pub(crate) fn open() -> Arc<TabLog> {
         let id = TAB_SEQ.fetch_add(1, Ordering::Relaxed);
+        let stem = format!("{}_{}_{}", file_stamp(), std::process::id(), id);
         let file = tab_dir().and_then(|dir| {
             std::fs::create_dir_all(&dir).ok()?;
-            let name = format!("{}_{}_{}.{}", file_stamp(), std::process::id(), id, TAB_EXT);
-            open_append(&dir.join(name))
+            open_append(&dir.join(format!("{stem}.{TAB_EXT}")))
         });
         Arc::new(TabLog {
             id,
+            stem,
             file: Mutex::new(file),
             write_failed: AtomicBool::new(false),
         })
@@ -260,6 +263,10 @@ impl TabLog {
 
     pub(crate) fn id(&self) -> u64 {
         self.id
+    }
+
+    pub(crate) fn stem(&self) -> &str {
+        &self.stem
     }
 
     pub(crate) fn event(&self, level: Level, args: Arguments) {

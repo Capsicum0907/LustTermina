@@ -222,6 +222,8 @@ pub(crate) struct LogSettings {
     pub(crate) deps_level: String,
     pub(crate) max_kb: u64,
     pub(crate) tab_keep: usize,
+    pub(crate) cast_max_kb: u64,
+    pub(crate) cast_keep: usize,
 }
 
 impl Default for LogSettings {
@@ -231,6 +233,8 @@ impl Default for LogSettings {
             deps_level: "warn".into(),
             max_kb: 4096,
             tab_keep: 100,
+            cast_max_kb: 51200,
+            cast_keep: 30,
         }
     }
 }

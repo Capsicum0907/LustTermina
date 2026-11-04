@@ -51,7 +51,7 @@ pub(crate) fn draw_tab(
     selected: bool,
     dragging: bool,
     mirror: bool, // パネルが右配置のとき内容を左右反転
-) -> (egui::Response, bool, bool) {
+) -> (egui::Response, bool, bool, bool) {
     let w = ui.available_width();
     let h = 30.0;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, h), Sense::click_and_drag());
@@ -60,7 +60,7 @@ pub(crate) fn draw_tab(
     if dragging {
         ui.painter()
             .rect_filled(rect, 6.0, Color32::from_gray(34));
-        return (resp, false, false);
+        return (resp, false, false, false);
     }
 
     // 閉じる×の当たり判定。左配置=右端 / 右配置=左端（本文と地続きな辺の反対側）。
@@ -112,9 +112,15 @@ pub(crate) fn draw_tab(
         Color32::from_gray(125)
     };
     painter.text(cr.center(), Align2::CENTER_CENTER, "×", FontId::proportional(15.0), cc);
+    let recording = session.is_recording();
+    if recording {
+        let dx = if mirror { 20.0 } else { -20.0 };
+        painter.circle_filled(Pos2::new(cr.center().x + dx, rect.center().y), 4.0, REC_COLOR);
+    }
 
     // 右クリック：このタブの背景色・アクセント色の選択／起動タブへの追加
     let mut add_startup = false;
+    let mut toggle_record = false;
     resp.context_menu(|ui| {
         ui.set_min_width(196.0);
         ui.label(egui::RichText::new("背景").color(TAB_TEXT));
@@ -132,10 +138,15 @@ pub(crate) fn draw_tab(
             add_startup = true;
             ui.close();
         }
+        let label = if recording { "画面の記録を止める" } else { "画面を記録する" };
+        if ui.button(label).clicked() {
+            toggle_record = true;
+            ui.close();
+        }
     });
 
     let close_clicked = cresp.clicked();
-    (resp, close_clicked, add_startup)
+    (resp, close_clicked, add_startup, toggle_record)
 }
 
 // 12色パレットから1色選ぶ（選択中は白枠）

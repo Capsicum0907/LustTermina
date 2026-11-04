@@ -13,6 +13,7 @@ pub(crate) const TAB_TEXT_ACTIVE: Color32 = Color32::from_gray(245);
 pub(crate) const ACCENT_GREEN: Color32 = Color32::from_rgb(0x19, 0xC3, 0x7D); // アクセント（アイコンと同じ緑）
 // 注意喚起（プリセット名の重複/空など、参照できない状態）用の橙。エラーではなく警告の色。
 pub(crate) const WARN_COLOR: Color32 = Color32::from_rgb(0xE0, 0x8A, 0x3A);
+pub(crate) const REC_COLOR: Color32 = Color32::from_rgb(0xE0, 0x40, 0x40);
 // 破壊的アクション（データ初期化・アンインストール）用の赤。緑=選択専用とは役割を分ける。
 pub(crate) const DANGER_FILL: Color32 = Color32::from_rgb(0x5A, 0x28, 0x28);
 pub(crate) const DANGER_BORDER: Color32 = Color32::from_rgb(0x8A, 0x40, 0x40);
