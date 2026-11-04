@@ -255,7 +255,9 @@ impl Session {
         let last_output = self.last_output.clone();
         let log = self.log.clone();
         log.event(Level::Info, format_args!("sending {} startup command(s)", commands.len()));
-        thread::spawn(move || {
+        let thread_log = log.clone();
+        let spawned = thread::Builder::new().name(format!("startup-cmds-{}", log.id())).spawn(move || {
+            let log = thread_log;
             let quiet = Duration::from_millis(quiet_ms);
             let max_wait = Duration::from_millis(max_wait_ms);
             let poll = Duration::from_millis(20);
@@ -272,28 +274,55 @@ impl Session {
                         .map(|t| t.elapsed())
                         .unwrap_or(quiet)
                         >= quiet;
-                    if idle || Instant::now() >= deadline {
-                        break;
+                    if idle {
+                        return true;
+                    }
+                    if Instant::now() >= deadline {
+                        return false;
                     }
                     thread::sleep(poll);
                 }
             };
-            let write = |bytes: &[u8]| {
-                if let Ok(mut w) = writer.lock() {
-                    if let Err(e) = w.write_all(bytes).and_then(|_| w.flush()) {
-                        log.write_error(&e);
-                    }
-                }
+            let write = |bytes: &[u8]| -> Result<(), String> {
+                let mut w = writer.lock().map_err(|_| "pty writer lock poisoned".to_string())?;
+                w.write_all(bytes).and_then(|_| w.flush()).map_err(|e| {
+                    log.write_error(&e);
+                    e.to_string()
+                })
             };
+            let total = commands.len();
+            let mut sent = 0usize;
             // まず初期プロンプト（シェル起動時の出力）が落ち着くのを待つ。
-            wait_settle();
-            for cmd in &commands {
-                write(cmd.as_bytes());
-                wait_settle(); // 本文と Enter を分離＋エコーが落ち着くまで
-                write(b"\r");
-                wait_settle(); // コマンド実行に伴う出力が落ち着くまで
+            if !wait_settle() {
+                log.event(Level::Info, format_args!("initial output did not settle within {max_wait_ms} ms; sending anyway"));
             }
+            for (i, cmd) in commands.iter().enumerate() {
+                let n = i + 1;
+                let body_settled = match write(cmd.as_bytes()) {
+                    Ok(()) => wait_settle(),
+                    Err(e) => {
+                        log.event(Level::Warn, format_args!("startup command {n}/{total} not sent: {cmd:?}: {e}"));
+                        continue;
+                    }
+                };
+                if let Err(e) = write(b"\r") {
+                    log.event(Level::Warn, format_args!("startup command {n}/{total} typed but Enter not sent: {cmd:?}: {e}"));
+                    continue;
+                }
+                sent += 1;
+                let after_settled = wait_settle();
+                let note = if body_settled && after_settled {
+                    String::new()
+                } else {
+                    format!(" (output still busy after {max_wait_ms} ms)")
+                };
+                log.event(Level::Info, format_args!("startup command {n}/{total} sent: {cmd:?}{note}"));
+            }
+            log.event(Level::Info, format_args!("==== startup commands finished: {sent}/{total} sent ===="));
         });
+        if let Err(e) = spawned {
+            log.event(Level::Error, format_args!("could not start the startup command thread: {e}"));
+        }
     }
 
     pub(crate) fn scroll_to_bottom(&self) {
