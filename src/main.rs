@@ -34,6 +34,7 @@ use crate::winintegration::*;
 
 pub(crate) const FONT_SIZE: f32 = 14.0;
 pub(crate) const PLAYBACK_MIN_FONT_SIZE: f32 = 6.0;
+pub(crate) const PLAYBACK_MAX_FONT_SIZE: f32 = 32.0;
 pub(crate) const PLAYBACK_FONT_STEP: f32 = 0.5;
 pub(crate) const PAD: f32 = 6.0;
 

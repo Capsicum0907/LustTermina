@@ -1,6 +1,6 @@
 //! アプリ本体：App 状態・更新ループ（eframe::App 実装）。
 use crate::Launch;
-use crate::{PAD, PLAYBACK_FONT_STEP, PLAYBACK_MIN_FONT_SIZE};
+use crate::{PAD, PLAYBACK_FONT_STEP, PLAYBACK_MAX_FONT_SIZE, PLAYBACK_MIN_FONT_SIZE};
 use std::sync::mpsc;
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Sense, Vec2};
 use crate::color::*;
@@ -1854,8 +1854,19 @@ impl eframe::App for App {
                             return;
                         }
                     }
-                    let fitted = self.sessions[active_idx].playback_grid().map(|(cols, rows)| {
-                        fit_fonts(&ctx, cols, rows, ui.available_size() - egui::Vec2::splat(2.0 * PAD))
+                    let avail = ui.available_size() - egui::Vec2::splat(2.0 * PAD);
+                    let sess = &mut self.sessions[active_idx];
+                    let fitted = sess.playback_grid().map(|(cols, rows)| {
+                        let key = (cols, rows, avail.x.round() as i32, avail.y.round() as i32);
+                        let size = match sess.fit_cache {
+                            Some((k, size)) if k == key => size,
+                            _ => {
+                                let size = fit_font_size(&ctx, cols, rows, avail);
+                                sess.fit_cache = Some((key, size));
+                                size
+                            }
+                        };
+                        TermFonts::measure(&ctx, size)
                     });
                     self.sessions[active_idx]
                         .draw(ui, &ctx, fitted.as_ref().unwrap_or(&term_fonts), !block_input);
@@ -1973,14 +1984,20 @@ impl eframe::App for App {
 }
 
 
-fn fit_fonts(ctx: &egui::Context, cols: usize, rows: usize, avail: egui::Vec2) -> TermFonts {
+fn fit_font_size(ctx: &egui::Context, cols: usize, rows: usize, avail: egui::Vec2) -> f32 {
+    let fits = |size: f32| {
+        let f = TermFonts::measure(ctx, size);
+        cols as f32 * f.cell_w <= avail.x && rows as f32 * f.cell_h <= avail.y
+    };
     let mut size = FONT_SIZE;
-    loop {
-        let fonts = TermFonts::measure(ctx, size);
-        let fits = cols as f32 * fonts.cell_w <= avail.x && rows as f32 * fonts.cell_h <= avail.y;
-        if fits || size <= PLAYBACK_MIN_FONT_SIZE {
-            return fonts;
+    if fits(size) {
+        while size + PLAYBACK_FONT_STEP <= PLAYBACK_MAX_FONT_SIZE && fits(size + PLAYBACK_FONT_STEP) {
+            size += PLAYBACK_FONT_STEP;
         }
-        size = (size - PLAYBACK_FONT_STEP).max(PLAYBACK_MIN_FONT_SIZE);
+    } else {
+        while size > PLAYBACK_MIN_FONT_SIZE && !fits(size) {
+            size = (size - PLAYBACK_FONT_STEP).max(PLAYBACK_MIN_FONT_SIZE);
+        }
     }
+    size
 }
