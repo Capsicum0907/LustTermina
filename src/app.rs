@@ -875,17 +875,16 @@ impl App {
                     if has_empty {
                         bad.insert(0, "(空の名前)".to_string());
                     }
-                    if !bad.is_empty() {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "⚠ 参照できない名前（重複/空）: {}",
-                                bad.join(" , ")
-                            ))
-                            .color(WARN_COLOR)
-                            .size(12.0),
-                        );
-                        ui.add_space(6.0);
-                    }
+                    let warning = if bad.is_empty() {
+                        String::from(" ")
+                    } else {
+                        format!("⚠ 参照できない名前（重複/空）: {}", bad.join(" , "))
+                    };
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(warning).color(WARN_COLOR).size(12.0))
+                            .truncate(),
+                    );
+                    ui.add_space(6.0);
 
                     let mut to_remove: Option<usize> = None;
                     let mut to_move: Option<(usize, isize)> = None;
