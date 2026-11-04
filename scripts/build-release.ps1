@@ -25,10 +25,19 @@ $ErrorActionPreference = 'Stop'
 Set-Location (Join-Path $PSScriptRoot '..')
 
 $userHome = $env:USERPROFILE
+$repo = (Get-Location).Path
+$repoAlias = 'lust_termina'
 $exe = 'target/release/lust_termina.exe'
 
-Write-Host "Building release with path remap ($userHome -> C:\Users\user) and static CRT ..."
-$env:RUSTFLAGS = "--remap-path-prefix=$userHome=C:\Users\user -C target-feature=+crt-static"
+$repoForms = @($repo, ($repo -replace '\\', '/'))
+if ($repo.StartsWith($userHome, [StringComparison]::OrdinalIgnoreCase)) {
+    $repoForms += ($userHome -replace '\\', '/') + $repo.Substring($userHome.Length)
+}
+$remaps = @("--remap-path-prefix=$userHome=C:\Users\user") +
+    ($repoForms | Select-Object -Unique | ForEach-Object { "--remap-path-prefix=$_=$repoAlias" })
+
+Write-Host "Building release with path remap (home -> C:\Users\user, repo -> $repoAlias) and static CRT ..."
+$env:RUSTFLAGS = (@($remaps) + '-C target-feature=+crt-static') -join ' '
 try {
     cargo build --release
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed ($LASTEXITCODE)" }
@@ -36,17 +45,22 @@ try {
     Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
 }
 
-# 実ユーザー名がバイナリに残っていたら失敗させる（握り潰さない）。
-$name = $env:USERNAME
-& findstr /C:"$name" $exe > $null 2>&1
-if ($LASTEXITCODE -eq 0) {
-    Write-Error "Path scrub FAILED: '$name' is still present in $exe. Do NOT publish this build."
+$needles = @($env:USERNAME, $env:COMPUTERNAME)
+if ($repo.StartsWith($userHome, [StringComparison]::OrdinalIgnoreCase)) {
+    $rel = $repo.Substring($userHome.Length).TrimStart('\')
+    $needles += $rel, ($rel -replace '\\', '/')
+}
+$text = [System.Text.Encoding]::Latin1.GetString([System.IO.File]::ReadAllBytes((Resolve-Path $exe)))
+$leaks = foreach ($n in ($needles | Where-Object { $_ })) {
+    $wide = ($n.ToCharArray() | ForEach-Object { "$_`0" }) -join ''
+    if ($text.IndexOf($n, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+        $text.IndexOf($wide, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $n }
+}
+if ($leaks) {
+    Write-Error "Path scrub FAILED: $($leaks -join ', ') still present in $exe. Do NOT publish this build."
     exit 1
 }
-
-# findstr は「見つからない」で exit 1 を返す（＝望ましい）。その $LASTEXITCODE が残るので、
-# 成功終了を明示する。
-Write-Host "OK: $exe built and scrubbed (no '$name' found)."
+Write-Host "OK: $exe built and scrubbed (user name, machine name and repository path not found)."
 
 # 配布用の版付きファイル名を生成する。版番号は Cargo.toml の [package] version を唯一の正とし、
 # 手打ちのリネーム（タイプミスの元）を廃す。生成物はスクラブ済み exe のバイト同一コピー。
