@@ -49,7 +49,6 @@ pub(crate) fn draw_tab(
     idx: usize,
     session: &mut Session,
     selected: bool,
-    closable: bool,
     dragging: bool,
     mirror: bool, // パネルが右配置のとき内容を左右反転
 ) -> (egui::Response, bool, bool) {
@@ -65,14 +64,9 @@ pub(crate) fn draw_tab(
     }
 
     // 閉じる×の当たり判定。左配置=右端 / 右配置=左端（本文と地続きな辺の反対側）。
-    let close = if closable {
-        let cx = if mirror { rect.left() + 13.0 } else { rect.right() - 13.0 };
-        let cr = egui::Rect::from_center_size(Pos2::new(cx, rect.center().y), Vec2::splat(18.0));
-        let id = ui.id().with((idx, "close"));
-        Some((cr, ui.interact(cr, id, Sense::click())))
-    } else {
-        None
-    };
+    let cx = if mirror { rect.left() + 13.0 } else { rect.right() - 13.0 };
+    let cr = egui::Rect::from_center_size(Pos2::new(cx, rect.center().y), Vec2::splat(18.0));
+    let cresp = ui.interact(cr, ui.id().with((idx, "close")), Sense::click());
 
     let painter = ui.painter();
     // アクティブ：このタブの背景色で塗り、外側の角だけ丸める＋外側辺にアクセントバー。
@@ -112,14 +106,12 @@ pub(crate) fn draw_tab(
         tcol,
     );
     // ×
-    if let Some((cr, cresp)) = &close {
-        let cc = if cresp.hovered() {
-            Color32::from_gray(235)
-        } else {
-            Color32::from_gray(125)
-        };
-        painter.text(cr.center(), Align2::CENTER_CENTER, "×", FontId::proportional(15.0), cc);
-    }
+    let cc = if cresp.hovered() {
+        Color32::from_gray(235)
+    } else {
+        Color32::from_gray(125)
+    };
+    painter.text(cr.center(), Align2::CENTER_CENTER, "×", FontId::proportional(15.0), cc);
 
     // 右クリック：このタブの背景色・アクセント色の選択／起動タブへの追加
     let mut add_startup = false;
@@ -142,7 +134,7 @@ pub(crate) fn draw_tab(
         }
     });
 
-    let close_clicked = close.as_ref().map_or(false, |(_, cresp)| cresp.clicked());
+    let close_clicked = cresp.clicked();
     (resp, close_clicked, add_startup)
 }
 

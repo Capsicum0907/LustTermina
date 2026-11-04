@@ -1448,7 +1448,6 @@ impl eframe::App for App {
                     .auto_shrink([false; 2])
                     .show(ui, |ui| {
                         ui.add_space(8.0);
-                        let closable = self.sessions.len() > 1;
                         // ドロップ位置の算定に使うため、各タブの矩形を順に集める。
                         let mut tab_rects: Vec<egui::Rect> = Vec::with_capacity(self.sessions.len());
                         let pointer = ui.input(|i| i.pointer.interact_pos());
@@ -1524,7 +1523,6 @@ impl eframe::App for App {
                                         i,
                                         &mut self.sessions[i],
                                         selected,
-                                        closable,
                                         is_dragged,
                                         self.panel_right,
                                     );
