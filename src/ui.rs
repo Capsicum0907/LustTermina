@@ -632,6 +632,7 @@ pub(crate) fn tab_spec_card(
                     ui.add_sized(
                         [150.0, 28.0],
                         egui::TextEdit::singleline(&mut spec.name)
+                            .id(egui::Id::new((id_scope, i, "name")))
                             .hint_text("名前")
                             .vertical_align(egui::Align::Center),
                     );
@@ -823,12 +824,14 @@ pub(crate) fn tab_spec_card(
                 ui.add_space(4.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut spec.cwd)
+                        .id(egui::Id::new((id_scope, i, "cwd")))
                         .hint_text("初期ディレクトリ（空＝既定）")
                         .desired_width(f32::INFINITY),
                 );
                 ui.add_space(4.0);
                 ui.add(
                     egui::TextEdit::multiline(&mut spec.commands_buf)
+                        .id(egui::Id::new((id_scope, i, "commands")))
                         .hint_text("起動コマンド（1行に1つ）")
                         .desired_rows(2)
                         .desired_width(f32::INFINITY),
