@@ -236,6 +236,43 @@ pub(crate) struct Settings {
     pub(crate) log: LogSettings,
     #[serde(default)]
     pub(crate) playback: PlaybackSettings,
+    #[serde(default)]
+    pub(crate) font: FontSettings,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[serde(default)]
+pub(crate) struct FontSettings {
+    pub(crate) terminal: String,
+    pub(crate) terminal_index: u32,
+}
+
+impl Default for FontSettings {
+    fn default() -> Self {
+        Self {
+            terminal: "BIZ-UDGothicR.ttc".into(),
+            terminal_index: 0,
+        }
+    }
+}
+
+pub(crate) fn resolve_font_path(name: &str) -> Option<std::path::PathBuf> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let direct = std::path::PathBuf::from(name);
+    if direct.is_absolute() {
+        return direct.is_file().then_some(direct);
+    }
+    let system = std::env::var_os("WINDIR").map(|w| std::path::Path::new(&w).join("Fonts"));
+    let user = std::env::var_os("LOCALAPPDATA")
+        .map(|l| std::path::Path::new(&l).join("Microsoft").join("Windows").join("Fonts"));
+    [system, user]
+        .into_iter()
+        .flatten()
+        .map(|dir| dir.join(name))
+        .find(|p| p.is_file())
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]

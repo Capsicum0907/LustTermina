@@ -21,6 +21,42 @@ use crate::recording::CastRecorder;
 use crate::playback::{PlaybackCtl, Player};
 use log::Level;
 
+pub(crate) const NARROW_FAMILY: &str = "narrow";
+pub(crate) const NARROW_BASE_FONT: &str = "Hack";
+
+pub(crate) struct TermFonts {
+    pub(crate) main: FontId,
+    pub(crate) narrow: FontId,
+    pub(crate) narrow_dy: f32,
+    pub(crate) cell_w: f32,
+    pub(crate) cell_h: f32,
+}
+
+impl TermFonts {
+    pub(crate) fn measure(ctx: &egui::Context, size: f32) -> Self {
+        let main = FontId::monospace(size);
+        let narrow_full = FontId::new(size, egui::FontFamily::Name(NARROW_FAMILY.into()));
+        let ppp = ctx.pixels_per_point();
+        let (cw, ch, nw) = ctx.fonts_mut(|f| {
+            (f.glyph_width(&main, 'M'), f.row_height(&main), f.glyph_width(&narrow_full, 'M'))
+        });
+        let cell_w = (cw * ppp).round().max(1.0) / ppp;
+        let cell_h = (ch * ppp).round().max(1.0) / ppp;
+        let scale = if nw > cell_w { cell_w / nw } else { 1.0 };
+        let narrow = FontId::new(size * scale, narrow_full.family);
+        let nh = ctx.fonts_mut(|f| f.row_height(&narrow));
+        TermFonts { main, narrow, narrow_dy: ((cell_h - nh) / 2.0).max(0.0), cell_w, cell_h }
+    }
+
+    fn for_char(&self, ch: char, wide: bool) -> (&FontId, f32) {
+        if !wide && (ch == '\\' || !ch.is_ascii()) {
+            (&self.narrow, self.narrow_dy)
+        } else {
+            (&self.main, 0.0)
+        }
+    }
+}
+
 // ---- グリッド寸法（alacritty の Dimensions を満たす最小実装）----
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TermSize {
@@ -668,7 +704,8 @@ impl Session {
     }
 
     // 中央領域にこのセッションのグリッドを描画する
-    pub(crate) fn draw(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, font: &FontId, cell_w: f32, cell_h: f32, allow_ime: bool) {
+    pub(crate) fn draw(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, fonts: &TermFonts, allow_ime: bool) {
+        let (font, cell_w, cell_h) = (&fonts.main, fonts.cell_w, fonts.cell_h);
         let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let rect = resp.rect;
         // 原点も物理ピクセルに合わせ、グリッドをピクセルに揃える
@@ -895,7 +932,8 @@ impl Session {
                 && c.ch != ' '
                 && c.ch != '\0';
             if draw_glyph {
-                painter.text(c.pos, Align2::LEFT_TOP, c.ch, font.clone(), c.fg);
+                let (glyph_font, dy) = fonts.for_char(c.ch, c.flags.contains(Flags::WIDE_CHAR));
+                painter.text(c.pos + Vec2::new(0.0, dy), Align2::LEFT_TOP, c.ch, glyph_font.clone(), c.fg);
             }
 
             // 全角は 2 セル幅なので下線/取り消し線もその幅で引く

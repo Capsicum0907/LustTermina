@@ -53,6 +53,7 @@ pub(crate) struct App {
     pub(crate) startup_max_wait_ms: u64, // 同・待ち上限（config 可変、既定 STARTUP_MAX_WAIT_MS）
     pub(crate) log_settings: LogSettings,
     pub(crate) playback_settings: PlaybackSettings,
+    pub(crate) font_settings: FontSettings,
     pub(crate) presets: Vec<TabSpec>,     // 型ライブラリ（再利用できるタブ定義。name が識別子）
     pub(crate) startup: Vec<StartupEntry>, // 起動時に開くタブ定義（空＝既定シェル1枚）
     pub(crate) script_runner: std::collections::BTreeMap<String, String>, // 拡張子→スクリプト実行シェル short
@@ -73,7 +74,8 @@ pub(crate) struct App {
 
 impl App {
     pub(crate) fn new(cc: &eframe::CreationContext<'_>, launch: Launch) -> Self {
-        setup_fonts(&cc.egui_ctx);
+        let font_settings = load_settings().map(|s| s.font).unwrap_or_default();
+        setup_fonts(&cc.egui_ctx, &font_settings);
         // egui のテーマをダーク固定（set_visuals は毎フレームのシステム追従に
         // 上書きされるが、theme_preference は設定として永続する）。メニュー等が黒くなる。
         cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
@@ -332,6 +334,7 @@ impl App {
             startup_max_wait_ms,
             log_settings,
             playback_settings,
+            font_settings,
             presets,
             startup,
             script_runner,
@@ -436,6 +439,7 @@ impl App {
             startup_max_wait_ms: self.startup_max_wait_ms,
             log: self.log_settings.clone(),
             playback: self.playback_settings.clone(),
+            font: self.font_settings.clone(),
             // 保存時に commands_buf（複数行テキスト）→ commands（行配列、空行除去）へ確定。
             presets: self
                 .presets
@@ -489,6 +493,7 @@ impl App {
         self.startup_max_wait_ms = STARTUP_MAX_WAIT_MS;
         self.log_settings = LogSettings::default();
         self.playback_settings = PlaybackSettings::default();
+        self.font_settings = FontSettings::default();
         self.presets.clear();
         self.startup.clear();
         self.script_runner.clear();
@@ -1794,7 +1799,7 @@ impl eframe::App for App {
             }
         }
 
-        let (font, cell_w, cell_h) = cell_metrics(&ctx, FONT_SIZE);
+        let term_fonts = TermFonts::measure(&ctx, FONT_SIZE);
 
         // タブ名編集中／確認ダイアログ／設定モーダル表示中は端末入力を止める
         let block_input = self.editing.is_some()
@@ -1843,14 +1848,11 @@ impl eframe::App for App {
                     if let Some(ctl) = self.sessions[active_idx].playback.clone() {
                         playback_bar(ui, &ctl);
                     }
-                    let (font, cell_w, cell_h) = match self.sessions[active_idx].playback_grid() {
-                        Some((cols, rows)) => {
-                            fit_metrics(&ctx, cols, rows, ui.available_size() - egui::Vec2::splat(2.0 * PAD))
-                        }
-                        None => (font.clone(), cell_w, cell_h),
-                    };
+                    let fitted = self.sessions[active_idx].playback_grid().map(|(cols, rows)| {
+                        fit_fonts(&ctx, cols, rows, ui.available_size() - egui::Vec2::splat(2.0 * PAD))
+                    });
                     self.sessions[active_idx]
-                        .draw(ui, &ctx, &font, cell_w, cell_h, !block_input);
+                        .draw(ui, &ctx, fitted.as_ref().unwrap_or(&term_fonts), !block_input);
                 });
         }
 
@@ -1965,24 +1967,13 @@ impl eframe::App for App {
 }
 
 
-// セル幅・高さを物理ピクセル境界に丸める。端数だと列ごとに 1px ズレて
-// 文字間隔が不揃いに見える（等幅なのにガタつく）ため。
-fn cell_metrics(ctx: &egui::Context, size: f32) -> (FontId, f32, f32) {
-    let font = FontId::monospace(size);
-    let ppp = ctx.pixels_per_point();
-    let (cw, ch) = ctx.fonts_mut(|f| (f.glyph_width(&font, 'M'), f.row_height(&font)));
-    let cell_w = (cw * ppp).round().max(1.0) / ppp;
-    let cell_h = (ch * ppp).round().max(1.0) / ppp;
-    (font, cell_w, cell_h)
-}
-
-fn fit_metrics(ctx: &egui::Context, cols: usize, rows: usize, avail: egui::Vec2) -> (FontId, f32, f32) {
+fn fit_fonts(ctx: &egui::Context, cols: usize, rows: usize, avail: egui::Vec2) -> TermFonts {
     let mut size = FONT_SIZE;
     loop {
-        let (font, cw, ch) = cell_metrics(ctx, size);
-        let fits = cols as f32 * cw <= avail.x && rows as f32 * ch <= avail.y;
+        let fonts = TermFonts::measure(ctx, size);
+        let fits = cols as f32 * fonts.cell_w <= avail.x && rows as f32 * fonts.cell_h <= avail.y;
         if fits || size <= PLAYBACK_MIN_FONT_SIZE {
-            return (font, cw, ch);
+            return fonts;
         }
         size = (size - PLAYBACK_FONT_STEP).max(PLAYBACK_MIN_FONT_SIZE);
     }

@@ -7,7 +7,7 @@ use crate::shells::ShellSpec;
 
 // CJK グリフを出すため、MS Gothic（端末向けの等幅JP）をフォールバックに登録。
 // 既定の egui フォント（Hack 等）は CJK を持たないので日本語が豆腐になる。
-pub(crate) fn setup_fonts(ctx: &egui::Context) {
+pub(crate) fn setup_fonts(ctx: &egui::Context, font: &crate::config::FontSettings) {
     use egui::{FontData, FontDefinitions, FontFamily};
     use std::sync::Arc;
     let mut fonts = FontDefinitions::default();
@@ -31,6 +31,25 @@ pub(crate) fn setup_fonts(ctx: &egui::Context) {
         false
     };
 
+    let terminal = crate::config::resolve_font_path(&font.terminal).and_then(|path| {
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let mut data = FontData::from_owned(bytes);
+                data.index = font.terminal_index;
+                fonts.font_data.insert("terminal".to_owned(), Arc::new(data));
+                log::info!("terminal font {} (index {})", path.display(), font.terminal_index);
+                Some(())
+            }
+            Err(e) => {
+                log::warn!("terminal font {} could not be read: {e}", path.display());
+                None
+            }
+        }
+    });
+    if terminal.is_none() && !font.terminal.trim().is_empty() {
+        log::warn!("terminal font {:?} not found; using the built-in font", font.terminal);
+    }
+
     // 既定フォント優先、無いグリフだけ icons / jp へフォールバック。
     for fam in [FontFamily::Monospace, FontFamily::Proportional] {
         let list = fonts.families.entry(fam).or_default();
@@ -39,6 +58,19 @@ pub(crate) fn setup_fonts(ctx: &egui::Context) {
             list.push("jp".to_owned());
         }
     }
+    if terminal.is_some() {
+        if let Some(list) = fonts.families.get_mut(&FontFamily::Monospace) {
+            list.insert(0, "terminal".to_owned());
+        }
+    }
+    let base = crate::session::NARROW_BASE_FONT.to_owned();
+    let mut narrow = vec![base.clone()];
+    if let Some(list) = fonts.families.get(&FontFamily::Monospace) {
+        narrow.extend(list.iter().filter(|name| **name != base).cloned());
+    }
+    fonts
+        .families
+        .insert(FontFamily::Name(crate::session::NARROW_FAMILY.into()), narrow);
     ctx.set_fonts(fonts);
 }
 // 縦タブ1個を描く。戻り値 = (本体レスポンス, ×クリック=閉じる, 起動タブに追加).
