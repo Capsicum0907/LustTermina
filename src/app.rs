@@ -1260,8 +1260,11 @@ impl eframe::App for App {
             }
         }
 
-        for sess in &mut self.sessions {
+        for (i, sess) in self.sessions.iter_mut().enumerate() {
             sess.note_exit();
+            if self.editing != Some(i) {
+                sess.note_props();
+            }
         }
 
         // スクリプト実行タブ（close_on_exit）: 子プロセスの終了を監視する。

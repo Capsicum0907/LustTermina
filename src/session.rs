@@ -109,6 +109,7 @@ pub(crate) struct Session {
     pub(crate) child: Box<dyn portable_pty::Child + Send + Sync>,
     pub(crate) log: Arc<TabLog>,
     pub(crate) exit_logged: bool,
+    logged_props: Option<(String, Color32, Color32)>,
 }
 
 impl Session {
@@ -237,6 +238,7 @@ impl Session {
             child,
             log,
             exit_logged: false,
+            logged_props: None,
         }
     }
 
@@ -307,6 +309,30 @@ impl Session {
                 self.log.write_error(&e);
             }
         }
+    }
+
+    pub(crate) fn note_props(&mut self) {
+        let hex = crate::config::color_to_hex;
+        let now = (self.title.clone(), self.bg, self.accent);
+        match &self.logged_props {
+            None => self.log.event(
+                Level::Info,
+                format_args!("appearance title={:?} bg={} accent={}", now.0, hex(now.1), hex(now.2)),
+            ),
+            Some(old) if *old == now => return,
+            Some(old) => {
+                if old.0 != now.0 {
+                    self.log.event(Level::Info, format_args!("title changed {:?} -> {:?}", old.0, now.0));
+                }
+                if old.1 != now.1 {
+                    self.log.event(Level::Info, format_args!("bg changed {} -> {}", hex(old.1), hex(now.1)));
+                }
+                if old.2 != now.2 {
+                    self.log.event(Level::Info, format_args!("accent changed {} -> {}", hex(old.2), hex(now.2)));
+                }
+            }
+        }
+        self.logged_props = Some(now);
     }
 
     pub(crate) fn note_exit(&mut self) {
@@ -800,6 +826,7 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.note_exit();
+        self.note_props();
         self.log.event(Level::Info, format_args!("tab closed (title={:?})", self.title));
     }
 }
