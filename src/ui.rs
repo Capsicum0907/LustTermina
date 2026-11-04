@@ -1212,28 +1212,55 @@ pub(crate) fn playback_bar(ui: &mut egui::Ui, ctl: &crate::playback::PlaybackCtl
     let finished = ctl.finished.load(Ordering::Relaxed);
     let paused = ctl.paused.load(Ordering::Relaxed);
     let speed = ctl.speed.load(Ordering::Relaxed);
+    let total = ctl.total_ms();
+    let pos = ctl.pos_ms.load(Ordering::Relaxed);
+    let clock = |ms: u64| format!("{}:{:02}", ms / 60_000, (ms / 1000) % 60);
     ui.horizontal(|ui| {
         ui.add_space(crate::PAD);
         if finished {
-            ui.label(egui::RichText::new("再生終了").color(TAB_TEXT));
+            if ui.button("最初から").clicked() {
+                ctl.seek(0);
+            }
         } else {
             let label = if paused { "再生" } else { "一時停止" };
             if ui.button(label).clicked() {
                 ctl.paused.store(!paused, Ordering::Relaxed);
             }
-            for s in crate::playback::SPEEDS {
-                if ui.selectable_label(speed == s, format!("{s}倍")).clicked() {
-                    ctl.speed.store(s, Ordering::Relaxed);
-                }
-            }
-            if ui.button("最後まで").clicked() {
-                ctl.skip.store(true, Ordering::Relaxed);
-                ctl.paused.store(false, Ordering::Relaxed);
+        }
+        for s in crate::playback::SPEEDS {
+            if ui.selectable_label(speed == s, format!("{s}倍")).clicked() {
+                ctl.speed.store(s, Ordering::Relaxed);
             }
         }
-        let secs = ctl.played_ms.load(Ordering::Relaxed) / 1000;
-        ui.label(
-            egui::RichText::new(format!("{}:{:02}", secs / 60, secs % 60)).color(Color32::from_gray(150)),
+        if ui.add_enabled(total.is_some() && !finished, egui::Button::new("最後まで")).clicked() {
+            if let Some(t) = total {
+                ctl.seek(t);
+            }
+        }
+        let time = match total {
+            Some(t) => format!("{} / {}", clock(pos.min(t)), clock(t)),
+            None => format!("{} / 長さを計測中", clock(pos)),
+        };
+        let time_w = 120.0;
+        ui.spacing_mut().slider_width = (ui.available_width() - time_w - crate::PAD * 2.0).max(60.0);
+        let id = ui.id().with("playback_seek");
+        let total_s = total.unwrap_or(0) as f64 / 1000.0;
+        let mut v = ui
+            .data(|d| d.get_temp::<f64>(id))
+            .unwrap_or(pos as f64 / 1000.0)
+            .min(total_s);
+        let resp = ui.add_enabled(
+            total.is_some(),
+            egui::Slider::new(&mut v, 0.0..=total_s.max(0.001)).show_value(false),
         );
+        if resp.dragged() {
+            ui.data_mut(|d| d.insert_temp(id, v));
+        } else {
+            if resp.drag_stopped() || resp.changed() {
+                ctl.seek((v * 1000.0) as u64);
+            }
+            ui.data_mut(|d| d.remove::<f64>(id));
+        }
+        ui.label(egui::RichText::new(time).color(Color32::from_gray(150)));
     });
 }
