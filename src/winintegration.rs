@@ -563,6 +563,39 @@ pub(crate) fn main_hwnd(frame: &eframe::Frame) -> Option<isize> {
 
 // 前面化の実体。eframe の描画フレームの中からも、トレイのクリック（ウィンドウ
 // プロシージャの中＝egui のフレームが回っていない状況）からも、同じ処理を使う。
+pub(crate) fn log_window_state_later(
+    action: &'static str,
+    expect_visible: bool,
+    hwnd: isize,
+    delay: std::time::Duration,
+) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, IsIconic, IsWindowVisible};
+    if hwnd == 0 {
+        log::warn!("{action}: window state not checked (main window handle unknown)");
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("window-check".into())
+        .spawn(move || {
+            std::thread::sleep(delay);
+            let h = HWND(hwnd as *mut core::ffi::c_void);
+            let (visible, minimized, foreground) = unsafe {
+                (
+                    IsWindowVisible(h).as_bool(),
+                    IsIconic(h).as_bool(),
+                    GetForegroundWindow() == h,
+                )
+            };
+            let ms = delay.as_millis();
+            if visible == expect_visible {
+                log::info!("{action} -> after {ms}ms visible={visible} minimized={minimized} foreground={foreground}");
+            } else {
+                log::warn!("{action} -> after {ms}ms visible={visible} (expected {expect_visible}) minimized={minimized} foreground={foreground}");
+            }
+        });
+}
+
 pub(crate) fn bring_hwnd_to_front(hwnd: isize) {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{

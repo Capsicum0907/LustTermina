@@ -17,6 +17,7 @@ use crate::FONT_SIZE;
 // 隠していたウィンドウを再表示してから前面化するまで置くフレーム数。Visible(true) は
 // このフレームの描画後に適用されるため、間を置かずに前面化しても相手がまだ不可視で効かない。
 const FRONT_DELAY_FRAMES: u8 = 2;
+const WINDOW_CHECK_DELAY: std::time::Duration = std::time::Duration::from_millis(1000);
 
 // ---- アプリ本体（複数セッション ＋ 縦タブ）----
 pub(crate) struct App {
@@ -1238,6 +1239,7 @@ impl App {
         // まだ不可視のウィンドウが相手で効かない。数フレーム置いてから前面化する。
         self.pending_front = FRONT_DELAY_FRAMES;
         ctx.request_repaint();
+        log_window_state_later("show requested", true, main_window(), WINDOW_CHECK_DELAY);
     }
 
     // ウィンドウだけ消して、シェル（PTY と読み取りスレッド）は動かし続ける。
@@ -1250,6 +1252,7 @@ impl App {
         log::info!("hiding window to tray");
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         self.hidden = true;
+        log_window_state_later("hide requested", false, main_window(), WINDOW_CHECK_DELAY);
     }
 }
 

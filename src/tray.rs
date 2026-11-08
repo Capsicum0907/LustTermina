@@ -102,6 +102,10 @@ pub(crate) fn set_main_window(hwnd: isize) {
 // 最小化中は eframe のフレームが止まるため、egui 側へ要求を積むだけでは誰も処理しない。
 // 隠している（Visible(false)）場合の再表示は eframe が可視状態を持っているので、
 // そちらは要求として積み、次のフレームで `ui()` に処理させる（フレームは回っている）。
+pub(crate) fn main_window() -> isize {
+    MAIN_HWND.load(Ordering::Acquire)
+}
+
 fn restore_main_window() {
     crate::winintegration::bring_hwnd_to_front(MAIN_HWND.load(Ordering::Acquire));
 }
