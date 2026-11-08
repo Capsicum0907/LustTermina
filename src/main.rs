@@ -15,6 +15,7 @@ use eframe::egui;
 mod app;
 mod color;
 mod config;
+mod gpu;
 mod icons;
 mod input;
 mod ipc;
@@ -318,6 +319,7 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([900.0, 560.0])
             .with_icon(icon),
+        wgpu_options: gpu::wgpu_options(),
         ..Default::default()
     };
     let result = eframe::run_native(

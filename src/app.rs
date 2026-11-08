@@ -93,6 +93,7 @@ impl App {
                     "renderer wgpu backend={:?} adapter={} type={:?} driver={} {}",
                     info.backend, info.name, info.device_type, info.driver, info.driver_info
                 );
+                crate::gpu::watch_device(rs);
             }
             None => log::info!("renderer is not wgpu"),
         }
