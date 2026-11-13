@@ -1,13 +1,33 @@
 use std::sync::Arc;
 
-use eframe::egui_wgpu::{self, SurfaceErrorAction, WgpuConfiguration};
-use eframe::wgpu::{CurrentSurfaceTexture, DeviceLostReason};
+use eframe::egui_wgpu::{self, SurfaceErrorAction, WgpuConfiguration, WgpuSetup};
+use eframe::wgpu::{Backends, CurrentSurfaceTexture, DeviceLostReason};
 
-pub(crate) fn wgpu_options() -> WgpuConfiguration {
-    WgpuConfiguration {
+pub(crate) fn wgpu_options(renderer: &str) -> WgpuConfiguration {
+    let mut cfg = WgpuConfiguration {
         on_surface_status: Arc::new(on_surface_status),
         ..Default::default()
+    };
+    if let Some(backends) = renderer_backends(renderer) {
+        if let WgpuSetup::CreateNew(setup) = &mut cfg.wgpu_setup {
+            setup.instance_descriptor.backends = backends;
+        }
     }
+    cfg
+}
+
+fn renderer_backends(renderer: &str) -> Option<Backends> {
+    let renderer = renderer.trim();
+    if renderer.is_empty() || renderer.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    let backends = Backends::from_comma_list(renderer);
+    if backends.is_empty() {
+        log::warn!("renderer {renderer:?} is not a known backend; using the default");
+        return None;
+    }
+    log::info!("renderer {renderer:?} requested from config");
+    Some(backends)
 }
 
 fn on_surface_status(status: &CurrentSurfaceTexture) -> SurfaceErrorAction {

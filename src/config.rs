@@ -145,6 +145,17 @@ mod config_tests {
     }
 
     #[test]
+    fn renderer_roundtrip() {
+        let s = Settings { renderer: "dx12".into(), ..Default::default() };
+        let text = toml::to_string_pretty(&s).expect("serialize");
+        assert!(text.contains("renderer = \"dx12\""), "{text}");
+        let back: Settings = toml::from_str(&text).expect("deserialize");
+        assert_eq!(back.renderer, "dx12");
+        let empty = toml::to_string_pretty(&Settings::default()).expect("serialize");
+        assert!(!empty.contains("renderer"), "{empty}");
+    }
+
+    #[test]
     fn record_flag_roundtrip() {
         let s = Settings {
             presets: vec![
@@ -238,6 +249,8 @@ pub(crate) struct Settings {
     pub(crate) playback: PlaybackSettings,
     #[serde(default)]
     pub(crate) font: FontSettings,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) renderer: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]

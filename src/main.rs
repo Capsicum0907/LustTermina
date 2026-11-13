@@ -319,7 +319,7 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([900.0, 560.0])
             .with_icon(icon),
-        wgpu_options: gpu::wgpu_options(),
+        wgpu_options: gpu::wgpu_options(&load_settings().map(|s| s.renderer).unwrap_or_default()),
         ..Default::default()
     };
     let result = eframe::run_native(

@@ -55,6 +55,7 @@ pub(crate) struct App {
     pub(crate) log_settings: LogSettings,
     pub(crate) playback_settings: PlaybackSettings,
     pub(crate) font_settings: FontSettings,
+    pub(crate) renderer: String,
     pub(crate) presets: Vec<TabSpec>,     // 型ライブラリ（再利用できるタブ定義。name が識別子）
     pub(crate) startup: Vec<StartupEntry>, // 起動時に開くタブ定義（空＝既定シェル1枚）
     pub(crate) script_runner: std::collections::BTreeMap<String, String>, // 拡張子→スクリプト実行シェル short
@@ -76,6 +77,7 @@ pub(crate) struct App {
 impl App {
     pub(crate) fn new(cc: &eframe::CreationContext<'_>, launch: Launch) -> Self {
         let font_settings = load_settings().map(|s| s.font).unwrap_or_default();
+        let renderer = load_settings().map(|s| s.renderer).unwrap_or_default();
         setup_fonts(&cc.egui_ctx, &font_settings);
         // egui のテーマをダーク固定（set_visuals は毎フレームのシステム追従に
         // 上書きされるが、theme_preference は設定として永続する）。メニュー等が黒くなる。
@@ -337,6 +339,7 @@ impl App {
             log_settings,
             playback_settings,
             font_settings,
+            renderer,
             presets,
             startup,
             script_runner,
@@ -442,6 +445,7 @@ impl App {
             log: self.log_settings.clone(),
             playback: self.playback_settings.clone(),
             font: self.font_settings.clone(),
+            renderer: self.renderer.clone(),
             // 保存時に commands_buf（複数行テキスト）→ commands（行配列、空行除去）へ確定。
             presets: self
                 .presets
@@ -496,6 +500,7 @@ impl App {
         self.log_settings = LogSettings::default();
         self.playback_settings = PlaybackSettings::default();
         self.font_settings = FontSettings::default();
+        self.renderer.clear();
         self.presets.clear();
         self.startup.clear();
         self.script_runner.clear();
